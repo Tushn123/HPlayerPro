@@ -6,6 +6,8 @@
 #include "hscope.h"
 #include "htime.h"
 
+#include <cstring>
+
 #define DEFAULT_BLOCK_TIMEOUT   10  // s
 
 std::atomic_flag HFFPlayer::s_ffmpeg_init = ATOMIC_FLAG_INIT;
@@ -28,6 +30,71 @@ static void list_devices() {
     avformat_close_input(&fmt_ctx);
     avformat_free_context(fmt_ctx);
     av_dict_free(&options);
+}
+
+static void debug_all_hardware_decoders() {
+    const AVCodec* codec = NULL;
+    void* iter = NULL;
+    
+    hlogi("=== Available Hardware Decoders ===");
+    hlogi("FFmpeg version: %s", av_version_info());
+    
+    // List all hardware device types
+    hlogi("\n--- Supported Hardware Device Types ---");
+    AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
+    while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE) {
+        hlogi("  Hardware device: %s", av_hwdevice_get_type_name(type));
+    }
+    
+    // List all hardware decoders
+    hlogi("\n--- Available Hardware Decoders ---");
+    int hw_decoder_count = 0;
+    while ((codec = av_codec_iterate(&iter))) {
+        if (av_codec_is_decoder(codec)) {
+            // Check if it's a hardware decoder by name suffix
+            const char* name = codec->name;
+            bool is_hw = false;
+            
+            if (strstr(name, "_cuvid") || strstr(name, "_qsv") || 
+                strstr(name, "_dxva2") || strstr(name, "_d3d11va") ||
+                strstr(name, "_videotoolbox") || strstr(name, "_vaapi") ||
+                strstr(name, "_vdpau") || strstr(name, "_mediacodec")) {
+                is_hw = true;
+            }
+            
+            // Also check hardware capability flag
+            if (codec->capabilities & AV_CODEC_CAP_HARDWARE) {
+                is_hw = true;
+            }
+            
+            if (is_hw) {
+                hw_decoder_count++;
+                hlogi("  [%d] Hardware decoder: %-25s (%s)", 
+                      hw_decoder_count, codec->name, codec->long_name);
+                
+                // Check supported hardware configurations
+                for (int i = 0; ; i++) {
+                    const AVCodecHWConfig* config = avcodec_get_hw_config(codec, i);
+                    if (!config) break;
+                    
+                    const char* hw_type = av_hwdevice_get_type_name(config->device_type);
+                    if (hw_type) {
+                        hlogi("      -> Supports device: %s (method: %d)", 
+                              hw_type, config->methods);
+                    }
+                }
+            }
+        }
+    }
+    
+    if (hw_decoder_count == 0) {
+        hlogi("  No hardware decoders found!");
+        hlogi("  Note: You may need to recompile FFmpeg with hardware acceleration support");
+    } else {
+        hlogi("\nTotal hardware decoders found: %d", hw_decoder_count);
+    }
+    
+    hlogi("=== End of Hardware Decoder List ===\n");
 }
 
 // NOTE: avformat_open_input,av_read_frame block
@@ -57,12 +124,16 @@ HFFPlayer::HFFPlayer()
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
     quit = 0;
 
+
     if (!s_ffmpeg_init.test_and_set()) {
         // av_register_all();
         // avcodec_register_all();
         avformat_network_init();
         avdevice_register_all();
         list_devices();
+        
+        // Debug: List all available hardware decoders
+        debug_all_hardware_decoders();
     }
 }
 
@@ -164,21 +235,67 @@ int HFFPlayer::open() {
     const AVCodec* codec = NULL;
     if (decode_mode != SOFTWARE_DECODE) {
 try_hardware_decode:
-        std::string decoder(avcodec_get_name(codec_param->codec_id));
-        if (decode_mode == HARDWARE_DECODE_CUVID) {
-            decoder += "_cuvid";
-            real_decode_mode = HARDWARE_DECODE_CUVID;
+        std::string codec_name(avcodec_get_name(codec_param->codec_id));
+        std::string decoder_name;
+        bool found = false;
+        
+        if (decode_mode == HARDWARE_DECODE_AUTO) {
+            // Auto mode: try all hardware decoders by priority
+            // Windows priority: CUVID(NVIDIA) > QSV(Intel) > D3D11VA > DXVA2
+            const char* hw_suffixes[] = {"_cuvid", "_qsv", "_d3d11va", "_dxva2"};
+            const char* hw_names[] = {"NVIDIA CUVID", "Intel QSV", "D3D11VA", "DXVA2"};
+            const int hw_modes[] = {HARDWARE_DECODE_CUVID, HARDWARE_DECODE_QSV, 
+                                    HARDWARE_DECODE_D3D11VA, HARDWARE_DECODE_DXVA2};
+            
+            for (int i = 0; i < 4; ++i) {
+                decoder_name = codec_name + hw_suffixes[i];
+                codec = avcodec_find_decoder_by_name(decoder_name.c_str());
+                
+                if (codec != NULL) {
+                    real_decode_mode = hw_modes[i];
+                    hlogi("Found hardware decoder: %s (%s)", decoder_name.c_str(), hw_names[i]);
+                    found = true;
+                    break;
+                } else {
+                    hlogi("Hardware decoder not available: %s (%s)", decoder_name.c_str(), hw_names[i]);
+                }
+            }
+        } else {
+            // Manual mode: try specific decoder
+            const char* suffix = NULL;
+            const char* hw_name = NULL;
+            
+            if (decode_mode == HARDWARE_DECODE_CUVID) {
+                suffix = "_cuvid";
+                hw_name = "NVIDIA CUVID";
+            } else if (decode_mode == HARDWARE_DECODE_QSV) {
+                suffix = "_qsv";
+                hw_name = "Intel QSV";
+            } else if (decode_mode == HARDWARE_DECODE_D3D11VA) {
+                suffix = "_d3d11va";
+                hw_name = "D3D11VA";
+            } else if (decode_mode == HARDWARE_DECODE_DXVA2) {
+                suffix = "_dxva2";
+                hw_name = "DXVA2";
+            }
+            
+            if (suffix != NULL) {
+                decoder_name = codec_name + suffix;
+                codec = avcodec_find_decoder_by_name(decoder_name.c_str());
+                
+                if (codec != NULL) {
+                    real_decode_mode = decode_mode;
+                    hlogi("Found hardware decoder: %s (%s)", decoder_name.c_str(), hw_name);
+                    found = true;
+                } else {
+                    hlogi("Hardware decoder not available: %s (%s)", decoder_name.c_str(), hw_name);
+                }
+            }
         }
-        else if (decode_mode == HARDWARE_DECODE_QSV) {
-            decoder += "_qsv";
-            real_decode_mode = HARDWARE_DECODE_QSV;
+        
+        if (!found) {
+            hlogi("No hardware decoder found, will try software decode");
         }
-        codec = avcodec_find_decoder_by_name(decoder.c_str());
-        if (codec == NULL) {
-            hlogi("Can not find decoder %s", decoder.c_str());
-            // goto try_software_decode;
-        }
-        hlogi("decoder=%s", decoder.c_str());
     }
 
     if (codec == NULL) {
@@ -190,6 +307,7 @@ try_software_decode:
             return ret;
         }
         real_decode_mode = SOFTWARE_DECODE;
+        hlogi("Using software decoder: %s", codec->name);
     }
 
     hlogi("codec_name: %s=>%s", codec->name, codec->long_name);
@@ -214,11 +332,43 @@ try_software_decode:
     ret = avcodec_open2(codec_ctx, codec, &codec_opts);
     if (ret != 0) {
         if (real_decode_mode != SOFTWARE_DECODE) {
-            hlogi("Can not open hardwrae codec error: %d, try software codec.", ret);
-            goto try_software_decode;
+            hlogi("Can not open hardware codec error: %d, try software codec.", ret);
+            // Clean up failed hardware decoder context
+            avcodec_free_context(&codec_ctx);
+            codec_ctx = NULL;
+            // Find software decoder
+            codec = avcodec_find_decoder(codec_param->codec_id);
+            if (codec == NULL) {
+                hloge("Can not find software decoder %s", avcodec_get_name(codec_param->codec_id));
+                ret = -30;
+                return ret;
+            }
+            real_decode_mode = SOFTWARE_DECODE;
+            hlogi("Using software decoder: %s", codec->name);
+            
+            // Reallocate decoder context
+            codec_ctx = avcodec_alloc_context3(codec);
+            if (codec_ctx == NULL) {
+                hloge("avcodec_alloc_context3");
+                ret = -40;
+                return ret;
+            }
+            
+            ret = avcodec_parameters_to_context(codec_ctx, codec_param);
+            if (ret != 0) {
+                hloge("avcodec_parameters_to_context error: %d", ret);
+                return ret;
+            }
+            
+            ret = avcodec_open2(codec_ctx, codec, &codec_opts);
+            if (ret != 0) {
+                hloge("Can not open software codec error: %d", ret);
+                return ret;
+            }
+        } else {
+            hloge("Can not open software codec error: %d", ret);
+            return ret;
         }
-        hloge("Can not open software codec error: %d", ret);
-        return ret;
     }
     video_stream->discard = AVDISCARD_DEFAULT;
 

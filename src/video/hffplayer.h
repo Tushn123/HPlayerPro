@@ -38,6 +38,7 @@ public:
     int64_t block_starttime;
     int64_t block_timeout;
     int     quit;
+    string version;
 
 private:
     static std::atomic_flag s_ffmpeg_init;

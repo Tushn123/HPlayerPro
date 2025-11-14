@@ -11,10 +11,13 @@
 
 enum {
     SOFTWARE_DECODE         = 1,
-    HARDWARE_DECODE_QSV     = 2,
-    HARDWARE_DECODE_CUVID   = 3,
+    HARDWARE_DECODE_AUTO    = 2,    // Auto select best hardware decoder
+    HARDWARE_DECODE_QSV     = 3,
+    HARDWARE_DECODE_CUVID   = 4,
+    HARDWARE_DECODE_DXVA2   = 5,
+    HARDWARE_DECODE_D3D11VA = 6,
 };
-#define DEFAULT_DECODE_MODE HARDWARE_DECODE_CUVID
+#define DEFAULT_DECODE_MODE HARDWARE_DECODE_AUTO
 
 enum hplayer_event_e {
     HPLAYER_OPEN_FAILED,
