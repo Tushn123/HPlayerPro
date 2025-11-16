@@ -356,7 +356,7 @@ void HVideoWidget::pause() {
 void HVideoWidget::resume() {
     if (status == PAUSE && pImpl_player) {
         pImpl_player->resume();
-        timer->start(1000 / (fps ? fps : pImpl_player->fps)/2);
+        timer->start(1000 / (fps ? fps : pImpl_player->fps));
         status = PLAY;
 
         updateUI();
@@ -399,7 +399,7 @@ void HVideoWidget::retry() {
 }
 
 void HVideoWidget::onOpenSucceed() {
-    timer->start(1000 / (fps ? fps : pImpl_player->fps)/2);
+    timer->start(1000 / (fps ? fps : pImpl_player->fps));
     status = PLAY;
     setAspectRatio(aspect_ratio);
     if (pImpl_player->duration > 0) {

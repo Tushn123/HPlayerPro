@@ -5,8 +5,13 @@
 #include "hstring.h"
 #include "hscope.h"
 #include "htime.h"
+extern "C"{
+#include <libavutil/time.h>
+}
+
 
 #include <cstring>
+#include <cmath>
 
 #define DEFAULT_BLOCK_TIMEOUT   10  // s
 
@@ -127,6 +132,38 @@ HFFPlayer::HFFPlayer()
     audio_buffer_size = 0;
     audio_channels = 0;
     audio_sample_rate = 0;
+    
+    // Initialize SDL audio
+    audio_dev_id = 0;
+    audio_hw_buf_size = 0;
+    audio_play_buf = NULL;
+    audio_play_buf_size = 0;
+    audio_play_buf_index = 0;
+    hmutex_init(&audio_queue_mutex);
+    
+    // Initialize clocks
+    init_clock(&audio_clock);
+    init_clock(&video_clock);
+    
+    // Read av_sync_type from config file
+    // 0=audio master (default), 1=video master, 2=external clock
+    std::string sync_type_str = g_confile->GetValue("av_sync_type", "video");
+    if (sync_type_str == "video") {
+        av_sync_type = 1;  // Video master
+    } else if (sync_type_str == "external") {
+        av_sync_type = 2;  // External clock
+    } else {
+        av_sync_type = 0;  // Audio master (default)
+    }
+    hlogi("AV sync type: %d (%s)", av_sync_type, 
+          av_sync_type == 0 ? "audio master" : av_sync_type == 1 ? "video master" : "external");
+    
+    audio_diff_cum = 0;
+    audio_diff_avg_coef = exp(log(0.01) / 20);
+    audio_diff_avg_count = 0;
+    frame_timer = 0;
+    frame_last_pts = 0;
+    frame_last_delay = 0;
 
     block_starttime = time(NULL);
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
@@ -134,6 +171,8 @@ HFFPlayer::HFFPlayer()
     
     // Initialize thread synchronization
     hmutex_init(&decoder_mutex);
+    hmutex_init(&audio_queue_mutex);
+    hmutex_init(&format_mutex);
     is_seeking.store(false);
 
 
@@ -152,6 +191,8 @@ HFFPlayer::HFFPlayer()
 HFFPlayer::~HFFPlayer() {
     close();
     hmutex_destroy(&decoder_mutex);
+    hmutex_destroy(&audio_queue_mutex);
+    hmutex_destroy(&format_mutex);
 }
 
 int HFFPlayer::open() {
@@ -540,6 +581,14 @@ try_software_decode:
                                 
                                 hlogi("Audio decoder initialized: channels=%d, sample_rate=%d", 
                                     audio_channels, audio_sample_rate);
+                                
+                                // Open SDL audio device
+                                if (audio_open() < 0) {
+                                    hloge("Failed to open SDL audio device");
+                                    // Continue without audio
+                                } else {
+                                    hlogi("SDL audio device opened successfully");
+                                }
                             }
                         }
                     }
@@ -548,11 +597,19 @@ try_software_decode:
         }
     }
 
+    // If no audio, use video as master clock
+    if (audio_stream_index < 0 || !audio_codec_ctx || audio_dev_id == 0) {
+        hlogi("No audio stream or audio initialization failed, using video clock as master");
+    }
+
     HThread::setSleepPolicy(HThread::SLEEP_UNTIL, 1000 / fps);
     return ret;
 }
 
 int HFFPlayer::close() {
+    // Close SDL audio first
+    audio_close();
+    
     if (fmt_opts) {
         av_dict_free(&fmt_opts);
         fmt_opts = NULL;
@@ -632,6 +689,10 @@ void HFFPlayer::flushDecoders() {
         avcodec_flush_buffers(audio_codec_ctx);
         hlogi("Audio decoder flushed");
     }
+    
+    // Reset clocks
+    init_clock(&audio_clock);
+    init_clock(&video_clock);
 }
 
 int HFFPlayer::seek(int64_t ms) {
@@ -666,6 +727,19 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
     // Clear frame cache before seeking
     clear_frame_cache();
     
+    // Clear audio queue
+    hmutex_lock(&audio_queue_mutex);
+    while (!audio_frame_queue.empty()) {
+        AudioFrame* af = audio_frame_queue.front();
+        audio_frame_queue.pop();
+        delete af;
+    }
+    hmutex_unlock(&audio_queue_mutex);
+    
+    // Reset playback buffer
+    audio_play_buf_index = 0;
+    audio_play_buf_size = 0;
+    
     // Reset EOF flag
     eof = 0;
     error = 0;
@@ -681,6 +755,9 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
         // to ensure we can decode to exact frame
         hlogi("Accurate seek mode: will decode to exact position");
     }
+    
+    // Lock format_mutex to prevent concurrent access with doTask()
+    hmutex_lock(&format_mutex);
     
     // Try to seek using video stream timestamp (more accurate)
     if (video_stream_index >= 0 && video_time_base_num && video_time_base_den) {
@@ -700,6 +777,7 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
             
             if (ret < 0) {
                 hloge("av_seek_frame failed for any stream: %d", ret);
+                hmutex_unlock(&format_mutex);  // Unlock before returning
                 is_seeking.store(false);  // Clear flag before returning
                 return ret;
             } else {
@@ -717,10 +795,13 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
         
         if (ret < 0) {
             hloge("av_seek_frame failed: %d", ret);
+            hmutex_unlock(&format_mutex);  // Unlock before returning
             is_seeking.store(false);  // Clear flag before returning
             return ret;
         }
     }
+    
+    hmutex_unlock(&format_mutex);
     
     // Lock decoder mutex before flushing
     hmutex_lock(&decoder_mutex);
@@ -948,6 +1029,48 @@ int HFFPlayer::processVideoPacket() {
         // Calculate original timestamp (no speed adjustment needed for HFFPlayer)
         // Speed control is handled by adjusting thread sleep time
         hframe.ts = frame->pts / (double)video_time_base_den * video_time_base_num * 1000;
+        
+        // Update video clock for A/V sync
+        AVRational tb;
+        tb.num = video_time_base_num;
+        tb.den = video_time_base_den;
+        double video_pts = frame->pts * av_q2d(tb);
+        
+        // Compute frame delay (duration)
+        double delay = video_pts - frame_last_pts;
+        if (delay <= 0 || delay > 1.0) {
+            // If delay is invalid, use last delay
+            delay = frame_last_delay;
+        }
+        
+        // Save for next frame
+        frame_last_pts = video_pts;
+        frame_last_delay = delay;
+        
+        // If not video master, adjust delay for sync
+        if (get_master_sync_type() != 1) {  // Not AV_SYNC_VIDEO_MASTER
+            delay = compute_target_delay(delay);
+        }
+        
+        // Update frame timer
+        double time = (double)av_gettime_relative() / 1000000.0;
+        if (frame_timer == 0) {
+            frame_timer = time;
+        }
+        frame_timer += delay;
+        
+        // Actual delay - sleep if we're ahead
+        double actual_delay = frame_timer - time;
+        if (actual_delay > 0 && actual_delay < 1.0) {  // Max 1 second
+            int sleep_ms = (int)(actual_delay * 1000);
+            if (sleep_ms > 0) {
+                msleep(sleep_ms);
+            }
+        }
+        
+        // Update video clock
+        time = (double)av_gettime_relative() / 1000000.0;
+        set_clock(&video_clock, video_pts, time);
     }
 
     push_frame(&hframe);
@@ -999,15 +1122,46 @@ int HFFPlayer::processAudioPacket() {
             (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
         
         if (out_samples > 0) {
-            int64_t audio_ts = 0;
-            if (audio_time_base_num && audio_time_base_den) {
-                audio_ts = audio_frame->pts / (double)audio_time_base_den * audio_time_base_num * 1000;
+            // Calculate PTS in seconds
+            double audio_pts = 0;
+            if (audio_frame->pts != AV_NOPTS_VALUE && audio_time_base_num && audio_time_base_den) {
+                AVRational atb;
+                atb.num = audio_time_base_num;
+                atb.den = audio_time_base_den;
+                audio_pts = audio_frame->pts * av_q2d(atb);
             }
             
-            // Here you can process the audio data (audio_buffer)
-            // For example: send to audio device, save to file, etc.
-            // hlogi("Audio frame decoded: pts=%lld samples=%d", audio_ts, out_samples);
+            // Create audio frame for queue
+            AudioFrame* af = new AudioFrame();
+            int data_size = out_samples * audio_channels * sizeof(int16_t);
+            af->data = (uint8_t*)av_malloc(data_size);
+            if (af->data) {
+                memcpy(af->data, audio_buffer, data_size);
+                af->size = data_size;
+                af->pts = audio_pts;
+                
+                // Push to queue
+                hmutex_lock(&audio_queue_mutex);
+                audio_frame_queue.push(af);
+                size_t queue_size = audio_frame_queue.size();
+                hmutex_unlock(&audio_queue_mutex);
+                
+                // Debug: Log first few frames
+                static int audio_frame_count = 0;
+                if (audio_frame_count < 5) {
+                    hlogi("Audio frame queued #%d: size=%d, pts=%.3f, queue_size=%zu", 
+                          audio_frame_count++, data_size, audio_pts, queue_size);
+                }
+            } else {
+                hloge("Failed to allocate audio frame buffer");
+                delete af;
+            }
+        } else {
+            hloge("swr_convert returned 0 or negative samples: %d", out_samples);
         }
+    } else {
+        if (!swr_ctx) hloge("swr_ctx is NULL");
+        if (!audio_buffer) hloge("audio_buffer is NULL");
     }
 
     return 0;
@@ -1018,6 +1172,16 @@ void HFFPlayer::doTask() {
     while (!quit) {
         // av_init_packet is deprecated in FFmpeg 5.x, packet is already initialized by av_packet_alloc
 
+        // Lock format_mutex to prevent concurrent access with seek()
+        hmutex_lock(&format_mutex);
+        
+        // Check if seeking in progress
+        if (is_seeking.load()) {
+            hmutex_unlock(&format_mutex);
+            msleep(10);  // Wait a bit for seek to complete
+            continue;
+        }
+        
         fmt_ctx->interrupt_callback.callback = interrupt_callback;
         fmt_ctx->interrupt_callback.opaque = this;
         block_starttime = time(NULL);
@@ -1025,6 +1189,9 @@ void HFFPlayer::doTask() {
         int ret = av_read_frame(fmt_ctx, packet);
         //hlogi("av_read_frame retval=%d", ret);
         fmt_ctx->interrupt_callback.callback = NULL;
+        
+        hmutex_unlock(&format_mutex);
+        
         if (ret != 0) {
             hlogi("No frame: %d", ret);
             if (!quit) {
@@ -1069,4 +1236,289 @@ void HFFPlayer::doTask() {
         }
         // Skip other streams
     }
+}
+
+// ==================== Clock Functions ====================
+void HFFPlayer::init_clock(Clock* c) {
+    c->pts = NAN;
+    c->pts_drift = 0;
+    c->last_updated = 0;
+    c->paused = 0;
+}
+
+void HFFPlayer::set_clock(Clock* c, double pts, double time) {
+    c->pts = pts;
+    c->last_updated = time;
+    c->pts_drift = c->pts - time;
+}
+
+double HFFPlayer::get_clock(Clock* c) {
+    if (c->paused) {
+        return c->pts;
+    } else {
+        double time = (double)av_gettime_relative() / 1000000.0;
+        return c->pts_drift + time;
+    }
+}
+
+int HFFPlayer::get_master_sync_type() {
+    // If no audio stream, video must be master
+    if (audio_stream_index < 0 || !audio_codec_ctx || audio_dev_id == 0) {
+        return 1;  // AV_SYNC_VIDEO_MASTER
+    }
+    
+    // If no video stream, audio must be master
+    if (video_stream_index < 0) {
+        return 0;  // AV_SYNC_AUDIO_MASTER
+    }
+    
+    // Otherwise use configured type
+    return av_sync_type;
+}
+
+double HFFPlayer::get_master_clock() {
+    int sync_type = get_master_sync_type();
+    
+    switch (sync_type) {
+    case 1:  // AV_SYNC_VIDEO_MASTER
+        return get_clock(&video_clock);
+    case 2:  // AV_SYNC_EXTERNAL_CLOCK
+        // For now, external clock is same as audio clock
+        // In a full implementation, this would be a separate clock
+        return get_clock(&audio_clock);
+    case 0:  // AV_SYNC_AUDIO_MASTER
+    default:
+        return get_clock(&audio_clock);
+    }
+}
+
+double HFFPlayer::compute_target_delay(double delay) {
+    // Reference: ffplay.c compute_target_delay()
+    // This function adjusts frame delay to sync video with master clock
+    
+    double sync_threshold, diff = 0;
+    
+    // Get the difference between video clock and master clock
+    diff = get_clock(&video_clock) - get_master_clock();
+    
+    // Compute sync threshold
+    // AV_SYNC_THRESHOLD_MIN = 0.04, AV_SYNC_THRESHOLD_MAX = 0.1
+    const double AV_SYNC_THRESHOLD_MIN = 0.04;
+    const double AV_SYNC_THRESHOLD_MAX = 0.1;
+    const double AV_SYNC_FRAMEDUP_THRESHOLD = 0.1;
+    const double AV_NOSYNC_THRESHOLD = 10.0;
+    
+    sync_threshold = (delay > AV_SYNC_THRESHOLD_MAX) ? AV_SYNC_THRESHOLD_MAX : 
+                     (delay < AV_SYNC_THRESHOLD_MIN) ? AV_SYNC_THRESHOLD_MIN : delay;
+    
+    if (!std::isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
+        if (diff <= -sync_threshold) {
+            // Video is behind audio, speed up (reduce delay)
+            delay = (delay + diff < 0) ? 0 : delay + diff;
+        } else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD) {
+            // Video is ahead of audio, slow down (increase delay)
+            delay = delay + diff;
+        } else if (diff >= sync_threshold) {
+            // Video is ahead but delay is small, duplicate frame (2x delay)
+            delay = 2 * delay;
+        }
+    }
+    
+    static int log_count = 0;
+    if (log_count < 5) {
+        hlogi("A-V sync: diff=%.3f, delay=%.3f->%.3f", -diff, frame_last_delay, delay);
+        log_count++;
+    }
+    
+    return delay;
+}
+
+// ==================== SDL Audio Functions ====================
+void HFFPlayer::sdl_audio_callback(void* userdata, uint8_t* stream, int len) {
+    HFFPlayer* player = (HFFPlayer*)userdata;
+    
+    static int callback_count = 0;
+    static bool first_call = true;
+    
+    if (first_call) {
+        hlogi("SDL audio callback called for the first time, len=%d", len);
+        first_call = false;
+    }
+    
+    memset(stream, 0, len);
+    
+    if (player->quit || player->is_seeking.load()) {
+        return;
+    }
+    
+    int total_written = 0;
+    while (len > 0) {
+        if (player->audio_play_buf_index >= player->audio_play_buf_size) {
+            // Need to decode more audio
+            double pts;
+            int audio_size = player->audio_decode_frame(&pts);
+            
+            if (audio_size < 0) {
+                // Error or no more frames, output silence
+                if (callback_count < 3) {
+                    hlogi("audio_decode_frame returned -1 (no frames in queue)");
+                }
+                player->audio_play_buf = NULL;
+                player->audio_play_buf_size = 512;
+            } else {
+                player->audio_play_buf_size = audio_size;
+                
+                if (callback_count < 3) {
+                    hlogi("Decoded audio frame: size=%d, pts=%.3f", audio_size, pts);
+                }
+                
+                // Update audio clock
+                if (!std::isnan(pts)) {
+                    double time = (double)av_gettime_relative() / 1000000.0;
+                    player->set_clock(&player->audio_clock, pts, time);
+                }
+            }
+            player->audio_play_buf_index = 0;
+        }
+        
+        int len1 = player->audio_play_buf_size - player->audio_play_buf_index;
+        if (len1 > len)
+            len1 = len;
+        
+        if (player->audio_play_buf) {
+            memcpy(stream, player->audio_play_buf + player->audio_play_buf_index, len1);
+            total_written += len1;
+        }
+        
+        len -= len1;
+        stream += len1;
+        player->audio_play_buf_index += len1;
+    }
+    
+    if (callback_count < 3) {
+        hlogi("SDL callback #%d: wrote %d bytes", callback_count, total_written);
+    }
+    callback_count++;
+}
+
+int HFFPlayer::audio_decode_frame(double* pts_ptr) {
+    hmutex_lock(&audio_queue_mutex);
+    
+    if (audio_frame_queue.empty()) {
+        hmutex_unlock(&audio_queue_mutex);
+        return -1;
+    }
+    
+    AudioFrame* af = audio_frame_queue.front();
+    audio_frame_queue.pop();
+    hmutex_unlock(&audio_queue_mutex);
+    
+    if (af && af->data && af->size > 0) {
+        *pts_ptr = af->pts;
+        int size = af->size;
+        
+        // Allocate or reallocate play buffer if needed
+        if (!audio_play_buf || size > audio_buffer_size * 2) {
+            if (audio_play_buf) {
+                av_free(audio_play_buf);
+            }
+            audio_play_buf = (uint8_t*)av_malloc(size);
+            if (!audio_play_buf) {
+                delete af;
+                return -1;
+            }
+        }
+        
+        // Copy audio data to play buffer
+        memcpy(audio_play_buf, af->data, size);
+        
+        delete af;  // Delete after copying
+        return size;
+    }
+    
+    if (af) {
+        delete af;
+    }
+    return -1;
+}
+
+int HFFPlayer::synchronize_audio(int nb_samples) {
+    // Simple version without tempo adjustment
+    // In a full implementation, this would adjust sample rate based on A/V diff
+    return nb_samples;
+}
+
+int HFFPlayer::audio_open() {
+    // Initialize SDL audio if not already done
+    static bool sdl_audio_initialized = false;
+    if (!sdl_audio_initialized) {
+        if (SDL_Init(SDL_INIT_AUDIO) < 0) {
+            hloge("Could not initialize SDL audio: %s", SDL_GetError());
+            return -1;
+        }
+        sdl_audio_initialized = true;
+        hlogi("SDL audio subsystem initialized");
+    }
+    
+    SDL_AudioSpec wanted_spec, spec;
+    memset(&wanted_spec, 0, sizeof(wanted_spec));
+    memset(&spec, 0, sizeof(spec));
+    
+    wanted_spec.freq = audio_sample_rate;
+    wanted_spec.format = AUDIO_S16SYS;
+    wanted_spec.channels = audio_channels;
+    wanted_spec.silence = 0;
+    wanted_spec.samples = 1024;  // Buffer size
+    wanted_spec.callback = sdl_audio_callback;
+    wanted_spec.userdata = this;
+    
+    hlogi("Opening SDL audio: freq=%d, channels=%d, format=S16", 
+          wanted_spec.freq, wanted_spec.channels);
+    
+    audio_dev_id = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+    
+    if (audio_dev_id == 0) {
+        hloge("Failed to open audio device: %s", SDL_GetError());
+        return -1;
+    }
+    
+    audio_hw_buf_size = spec.size;
+    
+    hlogi("SDL audio opened successfully:");
+    hlogi("  Device ID: %d", audio_dev_id);
+    hlogi("  Frequency: %d Hz (wanted %d)", spec.freq, wanted_spec.freq);
+    hlogi("  Channels: %d (wanted %d)", spec.channels, wanted_spec.channels);
+    hlogi("  Samples: %d", spec.samples);
+    hlogi("  Buffer size: %d bytes", spec.size);
+    
+    // Start audio playback
+    SDL_PauseAudioDevice(audio_dev_id, 0);
+    hlogi("SDL audio playback started");
+    
+    return 0;
+}
+
+void HFFPlayer::audio_close() {
+    if (audio_dev_id) {
+        SDL_PauseAudioDevice(audio_dev_id, 1);  // Pause first
+        SDL_CloseAudioDevice(audio_dev_id);
+        audio_dev_id = 0;
+    }
+    
+    // Clear audio queue
+    hmutex_lock(&audio_queue_mutex);
+    while (!audio_frame_queue.empty()) {
+        AudioFrame* af = audio_frame_queue.front();
+        audio_frame_queue.pop();
+        delete af;
+    }
+    hmutex_unlock(&audio_queue_mutex);
+    
+    // Free play buffer
+    if (audio_play_buf) {
+        av_free(audio_play_buf);
+        audio_play_buf = NULL;
+    }
+    audio_play_buf_size = 0;
+    audio_play_buf_index = 0;
 }

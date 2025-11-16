@@ -8,6 +8,32 @@
 #include "hmutex.h"
 
 #include <atomic>
+#include <SDL2/SDL.h>
+#include <queue>
+
+// Clock for A/V synchronization
+struct Clock {
+    double pts;
+    double pts_drift;
+    double last_updated;
+    int paused;
+    
+    Clock() : pts(0), pts_drift(0), last_updated(0), paused(0) {}
+};
+
+// Audio frame for queue
+struct AudioFrame {
+    uint8_t* data;
+    int size;
+    double pts;
+    
+    AudioFrame() : data(nullptr), size(0), pts(0) {}
+    ~AudioFrame() {
+        if (data) {
+            av_free(data);
+        }
+    }
+};
 
 class HFFPlayer : public HVideoPlayer, public HThread {
 public:
@@ -100,6 +126,26 @@ private:
     int             audio_buffer_size;
     int             audio_channels;
     int             audio_sample_rate;
+    
+    // SDL audio
+    SDL_AudioDeviceID audio_dev_id;
+    int             audio_hw_buf_size;
+    std::queue<AudioFrame*> audio_frame_queue;
+    hmutex_t        audio_queue_mutex;
+    uint8_t*        audio_play_buf;
+    int             audio_play_buf_size;
+    int             audio_play_buf_index;
+    
+    // Clocks for A/V sync
+    Clock           audio_clock;
+    Clock           video_clock;
+    int             av_sync_type;       // 0=audio master, 1=video master, 2=external
+    double          audio_diff_cum;
+    double          audio_diff_avg_coef;
+    int             audio_diff_avg_count;
+    double          frame_timer;
+    double          frame_last_pts;
+    double          frame_last_delay;
 
     // processing functions
     int processVideoPacket();
@@ -108,8 +154,24 @@ private:
     // helper functions
     void flushDecoders();
     
+    // Clock functions
+    void init_clock(Clock* c);
+    void set_clock(Clock* c, double pts, double time);
+    double get_clock(Clock* c);
+    double get_master_clock();
+    int get_master_sync_type();
+    double compute_target_delay(double delay);
+    
+    // Audio functions
+    int audio_open();
+    void audio_close();
+    static void sdl_audio_callback(void* userdata, uint8_t* stream, int len);
+    int audio_decode_frame(double* pts_ptr);
+    int synchronize_audio(int nb_samples);
+    
     // Thread synchronization
     hmutex_t        decoder_mutex;       // Protects decoder operations
+    hmutex_t        format_mutex;        // Protects fmt_ctx operations (read/seek)
     std::atomic<bool> is_seeking;        // Flag to indicate seeking in progress
 };
 

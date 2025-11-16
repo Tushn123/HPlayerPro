@@ -57,7 +57,7 @@ renderer = opengl
 # HARDWARE_DECODE_CUVID   = 4  # NVIDIA CUVID hardware decode
 # HARDWARE_DECODE_DXVA2   = 5  # Windows DXVA2 hardware decode
 # HARDWARE_DECODE_D3D11VA = 6  # Windows D3D11VA hardware decode
-decode_mode = 3
+decode_mode = 1
 
 # pix_fmt = [YUV, RGB]
 dst_pix_fmt = YUV
@@ -77,3 +77,10 @@ loop_playback = false
 last_tab = 0
 last_file_source = C:/shn/media/animal.mp4
 last_network_source = 
+
+[video]
+# 音视频同步模式
+# audio  - 音频同步（默认，推荐）
+# video  - 视频同步
+# external - 外部时钟同步
+av_sync_type=audio
