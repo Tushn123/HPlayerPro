@@ -73,12 +73,48 @@ static int load_confile() {
     // logfile
     string str = g_confile->GetValue("logfile");
     if (str.empty()) {
+        // No logfile specified, use default
         snprintf(g_log_file, sizeof(g_log_file), "%s/logs", g_exec_dir);
         hv_mkdir_p(g_log_file);
         snprintf(g_log_file, sizeof(g_log_file), "%s/logs/%s.log", g_exec_dir, APP_NAME);
     }
     else {
-        strncpy(g_log_file, str.c_str(), sizeof(g_log_file));
+        // Check if logfile is absolute or relative path
+        bool is_absolute = false;
+        
+        // Windows: check for drive letter (C:) or UNC path (\\)
+        if ((str.length() >= 2 && str[1] == ':') ||
+            (str.length() >= 2 && str[0] == '\\' && str[1] == '\\')) {
+            is_absolute = true;
+        }
+        // Unix: check for leading /
+        else if (str.length() >= 1 && str[0] == '/') {
+            is_absolute = true;
+        }
+        
+        if (is_absolute) {
+            // Already absolute path, use as is
+            strncpy(g_log_file, str.c_str(), sizeof(g_log_file));
+        } else {
+            // Relative path, convert to absolute based on exec_dir
+            snprintf(g_log_file, sizeof(g_log_file), "%s/%s", g_exec_dir, str.c_str());
+        }
+        
+        // Create log directory if it doesn't exist
+        char log_dir[256];
+        strncpy(log_dir, g_log_file, sizeof(log_dir));
+        log_dir[sizeof(log_dir) - 1] = '\0';
+        
+        // Find last path separator
+        char* last_sep = strrchr(log_dir, '/');
+        if (!last_sep) {
+            last_sep = strrchr(log_dir, '\\');
+        }
+        
+        if (last_sep) {
+            *last_sep = '\0';  // Truncate to get directory path
+            hv_mkdir_p(log_dir);
+        }
     }
     hlog_set_file(g_log_file);
     // loglevel

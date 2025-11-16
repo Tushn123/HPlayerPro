@@ -66,6 +66,7 @@ private:
     uint8_t*        data[4];
     int             linesize[4];
     HFrame          hframe;
+    bool            sws_ctx_checked;  // Flag to check if sws_ctx format matches actual decoded frame
 };
 
 #endif // H_FFPLAYER_H

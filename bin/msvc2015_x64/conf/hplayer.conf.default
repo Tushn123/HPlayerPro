@@ -19,7 +19,7 @@ main_window_height = 800
 # [NORMAL=0, MINIMIZED=1, MAXMIZED=2, FULLSCREEN=3]
 main_window_state = 2
 # rect(x,y,w,h)
-main_window_rect = rect(0,0,0,0)
+main_window_rect = rect(0,29,1920,991)
 
 menubar_visible = true
 toolbar_visible = true
@@ -27,8 +27,8 @@ statusbar_visible = true
 lside_visible = false
 rside_visible = false
 
-mv_row = 3
-mv_col = 3
+mv_row = 2
+mv_col = 2
 mv_fullscreen = false
 
 draw_time = false
@@ -50,9 +50,13 @@ frame_cache = 5
 # renderer = [opengl, sdl, ...]
 renderer = opengl
 
-# SOFTWARE_DECODE         = 1,
-# HARDWARE_DECODE_QSV     = 2,
-# HARDWARE_DECODE_CUVID   = 3,
+# decode_mode:
+# SOFTWARE_DECODE         = 1  # Software decode (best compatibility)
+# HARDWARE_DECODE_AUTO    = 2  # Auto select hardware decode (recommended)
+# HARDWARE_DECODE_QSV     = 3  # Intel QSV hardware decode
+# HARDWARE_DECODE_CUVID   = 4  # NVIDIA CUVID hardware decode
+# HARDWARE_DECODE_DXVA2   = 5  # Windows DXVA2 hardware decode
+# HARDWARE_DECODE_D3D11VA = 6  # Windows D3D11VA hardware decode
 decode_mode = 3
 
 # pix_fmt = [YUV, RGB]
@@ -62,8 +66,8 @@ dst_pix_fmt = YUV
 rtsp_transport = tcp
 
 # for network source retry
-retry_interval = 10000  # ms
-retry_maxcnt = -1 # -1 means INFINITE
+retry_interval = 10000	# ms
+retry_maxcnt = -1	# -1 means INFINITE
 
 # for file source loop playback
 loop_playback = false
@@ -71,5 +75,5 @@ loop_playback = false
 [media]
 # 0:file 1:network 2:capture
 last_tab = 0
-last_file_source = 
+last_file_source = C:/shn/media/animal.mp4
 last_network_source = 

@@ -25,7 +25,7 @@ static void list_devices() {
 #endif
     const AVInputFormat* ifmt = av_find_input_format(drive);
     if (ifmt) {
-        avformat_open_input(&fmt_ctx, "video=dummy", ifmt, &options);
+        avformat_open_input(&fmt_ctx, "video=dummy", (AVInputFormat*)ifmt, &options);
     }
     avformat_close_input(&fmt_ctx);
     avformat_free_context(fmt_ctx);
@@ -119,6 +119,7 @@ HFFPlayer::HFFPlayer()
     packet = NULL;
     frame = NULL;
     sws_ctx = NULL;
+    sws_ctx_checked = false;
 
     block_starttime = time(NULL);
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
@@ -196,7 +197,7 @@ int HFFPlayer::open() {
     fmt_ctx->interrupt_callback.callback = interrupt_callback;
     fmt_ctx->interrupt_callback.opaque = this;
     block_starttime = time(NULL);
-    ret = avformat_open_input(&fmt_ctx, ifile.c_str(), ifmt, &fmt_opts);
+    ret = avformat_open_input(&fmt_ctx, ifile.c_str(), (AVInputFormat*)ifmt, &fmt_opts);
     if (ret != 0) {
         hloge("Open input file[%s] failed: %d", ifile.c_str(), ret);
         return ret;
@@ -403,6 +404,9 @@ try_software_decode:
         ret = -50;
         return ret;
     }
+    
+    // Reset flag to check format on first decoded frame
+    sws_ctx_checked = false;
 
     packet = av_packet_alloc();
     frame = av_frame_alloc();
@@ -599,12 +603,84 @@ void HFFPlayer::doTask() {
 #endif
     }
 
+    // On first decoded frame, verify/recreate sws_ctx with actual frame format
+    if (!sws_ctx_checked) {
+        sws_ctx_checked = true;
+        
+        AVPixelFormat actual_fmt = (AVPixelFormat)frame->format;
+        
+        // Check if frame format matches what sws_ctx expects
+        if (actual_fmt != src_pix_fmt || frame->width != width || frame->height != height) {
+            hlogi("Frame format mismatch detected! Recreating sws_ctx...");
+            hlogi("Expected: %dx%d fmt=%s(%d)", width, height, 
+                  av_get_pix_fmt_name(src_pix_fmt), src_pix_fmt);
+            hlogi("Actual: %dx%d fmt=%s(%d)", frame->width, frame->height,
+                  av_get_pix_fmt_name(actual_fmt), actual_fmt);
+            
+            // Free old sws_ctx
+            if (sws_ctx) {
+                sws_freeContext(sws_ctx);
+                sws_ctx = NULL;
+            }
+            
+            // Update stored values
+            width = frame->width;
+            height = frame->height;
+            src_pix_fmt = actual_fmt;
+            
+            // Recreate with actual frame parameters
+            int dw = frame->width >> 2 << 2;  // align to 4
+            int dh = frame->height;
+            
+            sws_ctx = sws_getContext(
+                frame->width, frame->height, actual_fmt,  // actual source
+                dw, dh, dst_pix_fmt,                      // destination
+                SWS_BICUBIC, NULL, NULL, NULL);
+            
+            if (!sws_ctx) {
+                hloge("Failed to recreate sws_ctx!");
+                return;
+            }
+            
+            // Update hframe dimensions
+            hframe.w = dw;
+            hframe.h = dh;
+            hframe.buf.resize(dw * dh * 4);
+            
+            // Update data buffers for new dimensions
+            if (dst_pix_fmt == AV_PIX_FMT_YUV420P) {
+                data[0] = (uint8_t*)hframe.buf.base;
+                data[1] = data[0] + dw * dh;
+                data[2] = data[1] + dw * dh / 4;
+                linesize[0] = dw;
+                linesize[1] = dw / 2;
+                linesize[2] = dw / 2;
+            } else if (dst_pix_fmt == AV_PIX_FMT_BGR24) {
+                data[0] = (uint8_t*)hframe.buf.base;
+                linesize[0] = dw * 3;
+            }
+            
+            hlogi("sws_ctx recreated successfully: %dx%d %s -> %dx%d %s",
+                  frame->width, frame->height, av_get_pix_fmt_name(actual_fmt),
+                  dw, dh, av_get_pix_fmt_name(dst_pix_fmt));
+        } else {
+            hlogi("Frame format matches sws_ctx, no recreation needed");
+        }
+    }
+
     if (sws_ctx) {
         // hlogi("sws_scale w=%d h=%d data=%p", frame->width, frame->height, frame->data);
         int h = sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, data, linesize);
         // hlogi("sws_scale h=%d", h);
-        if (h <= 0 || h != frame->height) {
+        if (h <= 0) {
+            hloge("sws_scale failed! returned: %d, frame: %dx%d, format: %d(%s)", 
+                  h, frame->width, frame->height, frame->format,
+                  av_get_pix_fmt_name((AVPixelFormat)frame->format));
             return;
+        }
+        if (h != frame->height) {
+            hlogw("sws_scale returned different height: %d, expected: %d (continuing anyway)", 
+                  h, frame->height);
         }
     }
 
