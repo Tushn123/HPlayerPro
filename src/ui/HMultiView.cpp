@@ -250,5 +250,6 @@ void HMultiView::play(HMedia& media) {
     }
     else {
         player->open(media);
+        player->setPlaybackSpeed(2);
     }
 }

@@ -43,6 +43,7 @@ public:
         eof = 0;
         error = 0;
         event_cb = NULL;
+        playback_speed = 1.0;  // Normal speed by default
     }
 
     virtual ~HVideoPlayer() {}
@@ -62,6 +63,17 @@ public:
 
     void set_decode_mode(int mode) {
         decode_mode = mode;
+    }
+    
+    // Playback speed control (similar to ffplay's Clock::speed concept)
+    virtual void set_speed(double speed) {
+        if (speed > 0.0 && speed <= 16.0) {
+            playback_speed = speed;
+        }
+    }
+    
+    virtual double get_speed() const {
+        return playback_speed;
     }
 
     FrameStats get_frame_stats() {
@@ -111,6 +123,7 @@ public:
     int64_t     start_time; // ms
     int         eof;
     int         error;
+    double      playback_speed; // Playback speed (1.0 = normal, 2.0 = 2x, 0.5 = 0.5x)
 protected:
     HFrameBuf   frame_buf;
     hplayer_event_cb    event_cb;

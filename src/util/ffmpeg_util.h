@@ -8,6 +8,7 @@ extern "C" {
 #include "libavformat/avformat.h"
 #include "libavdevice/avdevice.h"
 #include "libswscale/swscale.h"
+#include "libswresample/swresample.h"
 }
 
 #endif // FFMPEG_UTIL_H

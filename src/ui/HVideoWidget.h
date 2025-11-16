@@ -42,6 +42,9 @@ public slots:
     void onPlayerError();
 
     void setAspectRatio(aspect_ratio_t aspect_ratio);
+    
+    // Playback speed control
+    void setPlaybackSpeed(double speed);
 
 protected:
     void initUI();
@@ -55,6 +58,7 @@ protected:
     virtual void mouseReleaseEvent(QMouseEvent *e);
     virtual void mouseMoveEvent(QMouseEvent *e);
     virtual void customEvent(QEvent* e);
+    void keyPressEvent(QKeyEvent *event) override;
 
 public:
     int     playerid;

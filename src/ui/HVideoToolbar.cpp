@@ -1,5 +1,6 @@
 #include "HVideoToolbar.h"
 #include "qtstyles.h"
+#include <QMouseEvent>
 
 HVideoToolbar::HVideoToolbar(QWidget *parent) : QFrame(parent)
 {
@@ -48,6 +49,8 @@ void HVideoToolbar::initUI() {
     lblDuration->hide();
 
     setLayout(hbox);
+
+    sldProgress->installEventFilter(this);
 }
 
 void HVideoToolbar::initConnect() {
@@ -59,4 +62,51 @@ void HVideoToolbar::initConnect() {
 
     connect(btnStop, SIGNAL(clicked(bool)), btnStart, SLOT(show()));
     connect(btnStop, SIGNAL(clicked(bool)), btnPause, SLOT(hide()));
+}
+
+// bool HVideoToolbar::eventFilter(QObject *watched, QEvent *event)
+// {
+//     if (watched == sldProgress && event->type() == QEvent::MouseButtonPress)
+//     {
+//         QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+
+//         if (mouseEvent->button() == Qt::LeftButton)
+//         {
+//             double position = (double)mouseEvent->pos().x() / sldProgress->width();
+//             int value = sldProgress->minimum() +
+//                         (sldProgress->maximum() - sldProgress->minimum()) * position;
+
+//             sldProgress->setValue(value);
+
+//             emit sldProgressClicked(value);
+
+//             return true;
+//         }
+//     }
+
+//     // 其他事件交给基类处理
+//     return QFrame::eventFilter(watched, event);
+// }
+
+bool HVideoToolbar::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == sldProgress) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            QMouseEvent *mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton) {
+                // 计算点击位置对应的值
+                double position = (double)mouseEvent->pos().x() / sldProgress->width();
+                int value = sldProgress->minimum() +
+                            (sldProgress->maximum() - sldProgress->minimum()) * position;
+
+                // 设置滑块值
+                sldProgress->setValue(value);
+
+                // 发出点击信号
+                emit sldProgressClicked(value);
+                return true; // 事件已处理，阻止后续的 sliderReleased
+            }
+        }
+    }
+    return QFrame::eventFilter(watched, event);
 }

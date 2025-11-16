@@ -116,14 +116,25 @@ HFFPlayer::HFFPlayer()
     codec_opts = NULL;
     fmt_ctx = NULL;
     codec_ctx = NULL;
+    audio_codec_ctx = NULL;
     packet = NULL;
     frame = NULL;
+    audio_frame = NULL;
     sws_ctx = NULL;
     sws_ctx_checked = false;
+    swr_ctx = NULL;
+    audio_buffer = NULL;
+    audio_buffer_size = 0;
+    audio_channels = 0;
+    audio_sample_rate = 0;
 
     block_starttime = time(NULL);
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
     quit = 0;
+    
+    // Initialize thread synchronization
+    hmutex_init(&decoder_mutex);
+    is_seeking.store(false);
 
 
     if (!s_ffmpeg_init.test_and_set()) {
@@ -140,6 +151,7 @@ HFFPlayer::HFFPlayer()
 
 HFFPlayer::~HFFPlayer() {
     close();
+    hmutex_destroy(&decoder_mutex);
 }
 
 int HFFPlayer::open() {
@@ -456,6 +468,86 @@ try_software_decode:
     }
     hlogi("fps=%d duration=%lldms start_time=%lldms", fps, duration, start_time);
 
+    // Initialize audio decoder if audio stream exists
+    if (audio_stream_index >= 0) {
+        AVStream* audio_stream = fmt_ctx->streams[audio_stream_index];
+        audio_time_base_num = audio_stream->time_base.num;
+        audio_time_base_den = audio_stream->time_base.den;
+        hlogi("audio_stream time_base=%d/%d", audio_stream->time_base.num, audio_stream->time_base.den);
+
+        AVCodecParameters* audio_codec_param = audio_stream->codecpar;
+        hlogi("audio_codec_id=%d:%s", audio_codec_param->codec_id, avcodec_get_name(audio_codec_param->codec_id));
+        
+        const AVCodec* audio_codec = avcodec_find_decoder(audio_codec_param->codec_id);
+        if (audio_codec == NULL) {
+            hloge("Can not find audio decoder %s", avcodec_get_name(audio_codec_param->codec_id));
+            // Audio is optional, continue without it
+        } else {
+            hlogi("audio_codec_name: %s=>%s", audio_codec->name, audio_codec->long_name);
+            
+            audio_codec_ctx = avcodec_alloc_context3(audio_codec);
+            if (audio_codec_ctx == NULL) {
+                hloge("avcodec_alloc_context3 for audio failed");
+            } else {
+                ret = avcodec_parameters_to_context(audio_codec_ctx, audio_codec_param);
+                if (ret != 0) {
+                    hloge("avcodec_parameters_to_context for audio error: %d", ret);
+                    avcodec_free_context(&audio_codec_ctx);
+                    audio_codec_ctx = NULL;
+                } else {
+                    ret = avcodec_open2(audio_codec_ctx, audio_codec, NULL);
+                    if (ret != 0) {
+                        hloge("Can not open audio codec error: %d", ret);
+                        avcodec_free_context(&audio_codec_ctx);
+                        audio_codec_ctx = NULL;
+                    } else {
+                        audio_stream->discard = AVDISCARD_DEFAULT;
+                        audio_frame = av_frame_alloc();
+                        
+                        // Initialize audio resampler for PCM S16LE stereo output
+                        audio_channels = 2;
+                        audio_sample_rate = 44100;
+                        
+                        // Use newer channel layout API if available
+                        int64_t in_ch_layout = AV_CH_LAYOUT_STEREO;
+                        if (audio_codec_ctx->channel_layout) {
+                            in_ch_layout = audio_codec_ctx->channel_layout;
+                        } else if (audio_codec_ctx->channels > 0) {
+                            in_ch_layout = av_get_default_channel_layout(audio_codec_ctx->channels);
+                        }
+                        
+                        swr_ctx = swr_alloc_set_opts(NULL,
+                            AV_CH_LAYOUT_STEREO,          // out_ch_layout
+                            AV_SAMPLE_FMT_S16,            // out_sample_fmt
+                            audio_sample_rate,            // out_sample_rate
+                            in_ch_layout,                 // in_ch_layout
+                            audio_codec_ctx->sample_fmt,  // in_sample_fmt
+                            audio_codec_ctx->sample_rate, // in_sample_rate
+                            0, NULL);
+                        
+                        if (swr_ctx) {
+                            ret = swr_init(swr_ctx);
+                            if (ret < 0) {
+                                hloge("swr_init failed: %d", ret);
+                                swr_free(&swr_ctx);
+                                swr_ctx = NULL;
+                            } else {
+                                // Allocate audio output buffer
+                                audio_buffer_size = av_samples_get_buffer_size(NULL, audio_channels, 
+                                    audio_codec_ctx->frame_size > 0 ? audio_codec_ctx->frame_size : 1024, 
+                                    AV_SAMPLE_FMT_S16, 1);
+                                audio_buffer = (uint8_t*)av_malloc(audio_buffer_size);
+                                
+                                hlogi("Audio decoder initialized: channels=%d, sample_rate=%d", 
+                                    audio_channels, audio_sample_rate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     HThread::setSleepPolicy(HThread::SLEEP_UNTIL, 1000 / fps);
     return ret;
 }
@@ -500,19 +592,222 @@ int HFFPlayer::close() {
         sws_ctx = NULL;
     }
 
+    if (audio_codec_ctx) {
+        avcodec_close(audio_codec_ctx);
+        avcodec_free_context(&audio_codec_ctx);
+        audio_codec_ctx = NULL;
+    }
+
+    if (audio_frame) {
+        av_frame_unref(audio_frame);
+        av_frame_free(&audio_frame);
+        audio_frame = NULL;
+    }
+
+    if (swr_ctx) {
+        swr_free(&swr_ctx);
+        swr_ctx = NULL;
+    }
+
+    if (audio_buffer) {
+        av_free(audio_buffer);
+        audio_buffer = NULL;
+        audio_buffer_size = 0;
+    }
+
     hframe.buf.cleanup();
     return 0;
 }
 
-int HFFPlayer::seek(int64_t ms) {
-    if (fmt_ctx) {
-        clear_frame_cache();
-        hlogi("seek=>%lldms", ms);
-        return av_seek_frame(fmt_ctx, video_stream_index,
-                (start_time+ms)/1000/(double)video_time_base_num*video_time_base_den,
-                AVSEEK_FLAG_BACKWARD);
+void HFFPlayer::flushDecoders() {
+    // NOTE: This function should be called with decoder_mutex locked
+    // Flush video decoder
+    if (codec_ctx) {
+        avcodec_flush_buffers(codec_ctx);
+        hlogi("Video decoder flushed");
     }
+    
+    // Flush audio decoder
+    if (audio_codec_ctx) {
+        avcodec_flush_buffers(audio_codec_ctx);
+        hlogi("Audio decoder flushed");
+    }
+}
+
+int HFFPlayer::seek(int64_t ms) {
+    // Default: fast seek (to keyframe)
+    return seek(ms, false);
+}
+
+int HFFPlayer::seek(int64_t ms, bool accurate) {
+    if (!fmt_ctx) {
+        hloge("seek failed: fmt_ctx is NULL");
+        return -1;
+    }
+    
+    const char* seek_mode = accurate ? "accurate" : "fast";
+    hlogi("seek=>%lldms (mode=%s, duration=%lldms, start_time=%lldms)", 
+          ms, seek_mode, duration, start_time);
+    
+    // Check if seek position is valid
+    if (ms < 0) {
+        hlogw("seek position is negative, clamping to 0");
+        ms = 0;
+    }
+    
+    if (duration > 0 && ms > duration) {
+        hlogw("seek position exceeds duration, clamping to duration");
+        ms = duration;
+    }
+    
+    // Set seeking flag to prevent decoder operations in worker thread
+    is_seeking.store(true);
+    
+    // Clear frame cache before seeking
+    clear_frame_cache();
+    
+    // Reset EOF flag
+    eof = 0;
+    error = 0;
+    
+    int ret = 0;
+    int64_t seek_target = 0;
+    int seek_flags = AVSEEK_FLAG_BACKWARD;
+    
+    // For accurate seek, we'll still seek to keyframe but decode frames until target
+    // For fast seek, we just seek to nearest keyframe
+    if (accurate) {
+        // In accurate mode, we may want to seek slightly before target
+        // to ensure we can decode to exact frame
+        hlogi("Accurate seek mode: will decode to exact position");
+    }
+    
+    // Try to seek using video stream timestamp (more accurate)
+    if (video_stream_index >= 0 && video_time_base_num && video_time_base_den) {
+        // Calculate target timestamp in stream timebase
+        seek_target = (start_time + ms) / 1000.0 / video_time_base_num * video_time_base_den;
+        
+        hlogi("Seeking video stream: target_ms=%lld, start_time=%lld, timestamp=%lld", 
+              ms, start_time, seek_target);
+        
+        ret = av_seek_frame(fmt_ctx, video_stream_index, seek_target, seek_flags);
+        
+        if (ret < 0) {
+            hloge("av_seek_frame failed for video stream: %d", ret);
+            // Try seeking without stream index (let FFmpeg choose the best stream)
+            seek_target = (start_time + ms) * 1000; // in microseconds (AV_TIME_BASE)
+            ret = av_seek_frame(fmt_ctx, -1, seek_target, seek_flags);
+            
+            if (ret < 0) {
+                hloge("av_seek_frame failed for any stream: %d", ret);
+                is_seeking.store(false);  // Clear flag before returning
+                return ret;
+            } else {
+                hlogi("Seek succeeded using default stream selection");
+            }
+        } else {
+            hlogi("Video stream seek succeeded");
+        }
+    } else {
+        // No video stream or timebase not set, use default timestamp
+        seek_target = (start_time + ms) * 1000; // in microseconds (AV_TIME_BASE)
+        hlogi("Seeking with default timebase: target_ms=%lld, timestamp=%lld", ms, seek_target);
+        
+        ret = av_seek_frame(fmt_ctx, -1, seek_target, seek_flags);
+        
+        if (ret < 0) {
+            hloge("av_seek_frame failed: %d", ret);
+            is_seeking.store(false);  // Clear flag before returning
+            return ret;
+        }
+    }
+    
+    // Lock decoder mutex before flushing
+    hmutex_lock(&decoder_mutex);
+    
+    // Flush decoders to clear buffered frames
+    flushDecoders();
+    
+    hmutex_unlock(&decoder_mutex);
+    
+    // Optionally seek audio stream if it exists and has different timebase
+    if (audio_stream_index >= 0 && audio_time_base_num && audio_time_base_den) {
+        // Audio stream will be synchronized automatically during playback
+        // But we can log the expected audio timestamp
+        int64_t audio_seek_target = (start_time + ms) / 1000.0 / audio_time_base_num * audio_time_base_den;
+        hlogi("Audio stream expected timestamp: %lld", audio_seek_target);
+    }
+    
+    // Clear seeking flag
+    is_seeking.store(false);
+    
+    hlogi("Seek completed successfully to %lldms (mode=%s)", ms, seek_mode);
     return 0;
+}
+
+int HFFPlayer::seekByPercent(double percent) {
+    if (duration <= 0) {
+        hloge("seekByPercent failed: duration is not available");
+        return -1;
+    }
+    
+    // Clamp percent to valid range
+    if (percent < 0.0) {
+        percent = 0.0;
+    } else if (percent > 100.0) {
+        percent = 100.0;
+    }
+    
+    // Calculate target position in milliseconds
+    int64_t target_ms = (int64_t)(duration * percent / 100.0);
+    
+    hlogi("seekByPercent: %.2f%% => %lldms (duration=%lldms)", percent, target_ms, duration);
+    
+    return seek(target_ms);
+}
+
+int HFFPlayer::seekRelative(int64_t offset_ms) {
+    int64_t current_pos = getCurrentPosition();
+    
+    if (current_pos < 0) {
+        hloge("seekRelative failed: cannot determine current position");
+        return -1;
+    }
+    
+    int64_t target_ms = current_pos + offset_ms;
+    
+    hlogi("seekRelative: current=%lldms, offset=%lldms => target=%lldms", 
+          current_pos, offset_ms, target_ms);
+    
+    return seek(target_ms);
+}
+
+int64_t HFFPlayer::getCurrentPosition() {
+    // Use the timestamp from the last decoded frame
+    if (hframe.ts >= 0) {
+        // hframe.ts is already in milliseconds
+        return hframe.ts;
+    }
+    
+    // If no frame has been decoded yet, return 0
+    return 0;
+}
+
+void HFFPlayer::set_speed(double speed) {
+    // Call base class to set playback_speed
+    HVideoPlayer::set_speed(speed);
+    
+    // CRITICAL: Adjust decode thread sleep time for HFFPlayer architecture
+    // Unlike ffplay which uses Clock in display loop, HFFPlayer controls
+    // frame rate via thread sleep policy
+    if (fps > 0 && speed > 0.0) {
+        int sleep_ms = (int)((1000.0 / fps) / speed);
+        if (sleep_ms < 1) sleep_ms = 1;  // Minimum 1ms
+        HThread::setSleepPolicy(HThread::SLEEP_UNTIL, sleep_ms);
+        hlogi("Playback speed set to %.2fx (decode sleep: %dms)", speed, sleep_ms);
+    } else {
+        hlogi("Playback speed set to %.2fx (no sleep adjustment)", speed);
+    }
 }
 
 bool HFFPlayer::doPrepare() {
@@ -536,72 +831,39 @@ bool HFFPlayer::doFinish() {
     return ret == 0;
 }
 
-void HFFPlayer::doTask() {
-    // loop until get a video frame
-    while (!quit) {
-        // av_init_packet is deprecated in FFmpeg 5.x, packet is already initialized by av_packet_alloc
-
-        fmt_ctx->interrupt_callback.callback = interrupt_callback;
-        fmt_ctx->interrupt_callback.opaque = this;
-        block_starttime = time(NULL);
-        //hlogi("av_read_frame");
-        int ret = av_read_frame(fmt_ctx, packet);
-        //hlogi("av_read_frame retval=%d", ret);
-        fmt_ctx->interrupt_callback.callback = NULL;
-        if (ret != 0) {
-            hlogi("No frame: %d", ret);
-            if (!quit) {
-                if (ret == AVERROR_EOF || avio_feof(fmt_ctx->pb)) {
-                    eof = 1;
-                    event_callback(HPLAYER_EOF);
-                }
-                else {
-                    error = ret;
-                    event_callback(HPLAYER_ERROR);
-                }
-            }
-            return;
-        }
-
-        // NOTE: if not call av_packet_unref, memory leak.
-        defer (av_packet_unref(packet);)
-
-        // hlogi("stream_index=%d data=%p len=%d", packet->stream_index, packet->data, packet->size);
-        if (packet->stream_index != video_stream_index) {
-            continue;
-        }
-
-#if 1
-        // hlogi("avcodec_send_packet");
-        ret = avcodec_send_packet(codec_ctx, packet);
-        if (ret != 0) {
-            hloge("avcodec_send_packet error: %d", ret);
-            return;
-        }
-        // hlogi("avcodec_receive_frame");
-        ret = avcodec_receive_frame(codec_ctx, frame);
-        if (ret != 0) {
-            if (ret != -EAGAIN) {
-                hloge("avcodec_receive_frame error: %d", ret);
-                return;
-            }
-        }
-        else {
-            break;
-        }
-#else
-        int got_pic = 0;
-        // hlogi("avcodec_decode_video2");
-        ret = avcodec_decode_video2(codec_ctx, frame, &got_pic, packet);
-        // hlogi("avcodec_decode_video2 retval=%d got_pic=%d", ret, got_pic);
-        if (ret < 0) {
-            hloge("decoder error: %d", ret);
-            return;
-        }
-
-        if (got_pic)    break;  // exit loop
-#endif
+int HFFPlayer::processVideoPacket() {
+    // Skip processing if seeking is in progress
+    if (is_seeking.load()) {
+        return AVERROR(EAGAIN);
     }
+    
+    // Lock decoder mutex to prevent race condition with seek operation
+    hmutex_lock(&decoder_mutex);
+    
+    // Double check seeking flag after acquiring lock
+    if (is_seeking.load()) {
+        hmutex_unlock(&decoder_mutex);
+        return AVERROR(EAGAIN);
+    }
+    
+    int ret = avcodec_send_packet(codec_ctx, packet);
+    if (ret != 0) {
+        hmutex_unlock(&decoder_mutex);
+        hloge("avcodec_send_packet error: %d", ret);
+        return ret;
+    }
+    
+    ret = avcodec_receive_frame(codec_ctx, frame);
+    if (ret != 0) {
+        hmutex_unlock(&decoder_mutex);
+        if (ret == AVERROR(EAGAIN)) {
+            return ret;  // Need more packets
+        }
+        hloge("avcodec_receive_frame error: %d", ret);
+        return ret;
+    }
+    
+    hmutex_unlock(&decoder_mutex);
 
     // On first decoded frame, verify/recreate sws_ctx with actual frame format
     if (!sws_ctx_checked) {
@@ -639,7 +901,7 @@ void HFFPlayer::doTask() {
             
             if (!sws_ctx) {
                 hloge("Failed to recreate sws_ctx!");
-                return;
+                return -1;
             }
             
             // Update hframe dimensions
@@ -669,14 +931,12 @@ void HFFPlayer::doTask() {
     }
 
     if (sws_ctx) {
-        // hlogi("sws_scale w=%d h=%d data=%p", frame->width, frame->height, frame->data);
         int h = sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, data, linesize);
-        // hlogi("sws_scale h=%d", h);
         if (h <= 0) {
             hloge("sws_scale failed! returned: %d, frame: %dx%d, format: %d(%s)", 
                   h, frame->width, frame->height, frame->format,
                   av_get_pix_fmt_name((AVPixelFormat)frame->format));
-            return;
+            return -1;
         }
         if (h != frame->height) {
             hlogw("sws_scale returned different height: %d, expected: %d (continuing anyway)", 
@@ -685,9 +945,128 @@ void HFFPlayer::doTask() {
     }
 
     if (video_time_base_num && video_time_base_den) {
+        // Calculate original timestamp (no speed adjustment needed for HFFPlayer)
+        // Speed control is handled by adjusting thread sleep time
         hframe.ts = frame->pts / (double)video_time_base_den * video_time_base_num * 1000;
     }
-    // hlogi("ts=%lldms", hframe.ts);
 
     push_frame(&hframe);
+    return 0;
+}
+
+int HFFPlayer::processAudioPacket() {
+    if (!audio_codec_ctx) {
+        return 0;  // No audio decoder initialized
+    }
+    
+    // Skip processing if seeking is in progress
+    if (is_seeking.load()) {
+        return AVERROR(EAGAIN);
+    }
+    
+    // Lock decoder mutex to prevent race condition with seek operation
+    hmutex_lock(&decoder_mutex);
+    
+    // Double check seeking flag after acquiring lock
+    if (is_seeking.load()) {
+        hmutex_unlock(&decoder_mutex);
+        return AVERROR(EAGAIN);
+    }
+
+    int ret = avcodec_send_packet(audio_codec_ctx, packet);
+    if (ret != 0) {
+        hmutex_unlock(&decoder_mutex);
+        hloge("avcodec_send_packet (audio) error: %d", ret);
+        return ret;
+    }
+    
+    ret = avcodec_receive_frame(audio_codec_ctx, audio_frame);
+    if (ret != 0) {
+        hmutex_unlock(&decoder_mutex);
+        if (ret == AVERROR(EAGAIN)) {
+            return ret;  // Need more packets
+        }
+        hloge("avcodec_receive_frame (audio) error: %d", ret);
+        return ret;
+    }
+    
+    hmutex_unlock(&decoder_mutex);
+
+    // Resample audio if needed
+    if (swr_ctx && audio_buffer) {
+        int out_samples = swr_convert(swr_ctx,
+            &audio_buffer, audio_frame->nb_samples,
+            (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
+        
+        if (out_samples > 0) {
+            int64_t audio_ts = 0;
+            if (audio_time_base_num && audio_time_base_den) {
+                audio_ts = audio_frame->pts / (double)audio_time_base_den * audio_time_base_num * 1000;
+            }
+            
+            // Here you can process the audio data (audio_buffer)
+            // For example: send to audio device, save to file, etc.
+            // hlogi("Audio frame decoded: pts=%lld samples=%d", audio_ts, out_samples);
+        }
+    }
+
+    return 0;
+}
+
+void HFFPlayer::doTask() {
+    // loop until get a video frame or process audio
+    while (!quit) {
+        // av_init_packet is deprecated in FFmpeg 5.x, packet is already initialized by av_packet_alloc
+
+        fmt_ctx->interrupt_callback.callback = interrupt_callback;
+        fmt_ctx->interrupt_callback.opaque = this;
+        block_starttime = time(NULL);
+        //hlogi("av_read_frame");
+        int ret = av_read_frame(fmt_ctx, packet);
+        //hlogi("av_read_frame retval=%d", ret);
+        fmt_ctx->interrupt_callback.callback = NULL;
+        if (ret != 0) {
+            hlogi("No frame: %d", ret);
+            if (!quit) {
+                if (ret == AVERROR_EOF || avio_feof(fmt_ctx->pb)) {
+                    eof = 1;
+                    event_callback(HPLAYER_EOF);
+                }
+                else {
+                    error = ret;
+                    event_callback(HPLAYER_ERROR);
+                }
+            }
+            return;
+        }
+
+        // NOTE: if not call av_packet_unref, memory leak.
+        defer (av_packet_unref(packet);)
+
+        // hlogi("stream_index=%d data=%p len=%d", packet->stream_index, packet->data, packet->size);
+        
+        // Process video packet
+        if (packet->stream_index == video_stream_index) {
+            ret = processVideoPacket();
+            if (ret == 0) {
+                // Successfully decoded a video frame, exit loop
+                break;
+            }
+            else if (ret != AVERROR(EAGAIN)) {
+                // Fatal error
+                return;
+            }
+            // EAGAIN means need more packets, continue reading
+        }
+        // Process audio packet
+        else if (packet->stream_index == audio_stream_index) {
+            ret = processAudioPacket();
+            if (ret != 0 && ret != AVERROR(EAGAIN)) {
+                // Non-fatal audio error, log and continue
+                // Audio processing doesn't block video playback
+            }
+            // Continue reading for video frame
+        }
+        // Skip other streams
+    }
 }

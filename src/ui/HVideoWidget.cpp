@@ -180,6 +180,12 @@ void HVideoWidget::initConnect() {
             pImpl_player->seek(toolbar->sldProgress->value()*1000);
         }
     });
+    connect( toolbar, &HVideoToolbar::sldProgressClicked, [this](int value) {
+        if (pImpl_player) {
+            pImpl_player->seek(toolbar->sldProgress->value()*1000);
+        }
+    });
+
 
     timer = new QTimer(this);
     timer->setTimerType(Qt::PreciseTimer);
@@ -250,6 +256,31 @@ void HVideoWidget::customEvent(QEvent* e) {
         onPlayerError();
         break;
     default:
+        break;
+    }
+}
+
+void HVideoWidget::keyPressEvent(QKeyEvent *event)
+{
+    if (!pImpl_player) return;
+
+    switch(event->key()) {
+    case Qt::Key_BracketRight:  // ] 键加速
+    {
+        double speed = pImpl_player->get_speed();
+        speed = qMin(speed + 0.25, 4.0);
+        setPlaybackSpeed(speed);
+        break;
+    }
+    case Qt::Key_BracketLeft:   // [ 键减速
+    {
+        double speed = pImpl_player->get_speed();
+        speed = qMax(speed - 0.25, 0.25);
+        setPlaybackSpeed(speed);
+        break;
+    }
+    case Qt::Key_Backslash:     // \ 键恢复正常
+        setPlaybackSpeed(1.0);
         break;
     }
 }
@@ -325,7 +356,7 @@ void HVideoWidget::pause() {
 void HVideoWidget::resume() {
     if (status == PAUSE && pImpl_player) {
         pImpl_player->resume();
-        timer->start(1000 / (fps ? fps : pImpl_player->fps));
+        timer->start(1000 / (fps ? fps : pImpl_player->fps)/2);
         status = PLAY;
 
         updateUI();
@@ -368,7 +399,7 @@ void HVideoWidget::retry() {
 }
 
 void HVideoWidget::onOpenSucceed() {
-    timer->start(1000 / (fps ? fps : pImpl_player->fps));
+    timer->start(1000 / (fps ? fps : pImpl_player->fps)/2);
     status = PLAY;
     setAspectRatio(aspect_ratio);
     if (pImpl_player->duration > 0) {
@@ -379,6 +410,8 @@ void HVideoWidget::onOpenSucceed() {
         toolbar->sldProgress->setRange(0, duration_sec);
         toolbar->lblDuration->show();
         toolbar->sldProgress->show();
+        toolbar->btnPrev->show();
+        toolbar->btnNext->show();
     }
 
     if (retry_cnt != 0) {
@@ -510,4 +543,11 @@ void HVideoWidget::setAspectRatio(aspect_ratio_t ar) {
     int x = border + (scr_w - dst_w) / 2;
     int y = border + (scr_h - dst_h) / 2;
     videownd->setGeometry(QRect(x, y, dst_w, dst_h));
+}
+
+void HVideoWidget::setPlaybackSpeed(double speed) {
+    if (pImpl_player) {
+        pImpl_player->set_speed(speed);
+        hlogi("Playback speed changed to %.2fx", speed);
+    }
 }

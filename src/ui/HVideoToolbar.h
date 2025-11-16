@@ -13,12 +13,14 @@ signals:
     void sigStart();
     void sigPause();
     void sigStop();
+    void sldProgressClicked(int value);
 
 public slots:
 
 protected:
     void initUI();
     void initConnect();
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 public:
     QPushButton *btnStart;

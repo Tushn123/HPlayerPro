@@ -213,6 +213,10 @@ win32 {
             -lsecur32     \
 
     win32-msvc {
+        # Fix Chinese character encoding issues
+        QMAKE_CFLAGS += /utf-8
+        QMAKE_CXXFLAGS += /utf-8
+        
         if (contains(DEFINES, WIN64)) {
             DESTDIR = $$_PRO_FILE_PWD_/bin/msvc2015_x64
             LIBS += -L$$_PRO_FILE_PWD_/3rd/lib/msvc2015_x64
@@ -223,8 +227,10 @@ win32 {
     }
 
     win32-g++ {
-        QMAKE_CFLAGS += -std=c99
-        QMAKE_CXXFLAGS += -std=c++11
+        # Fix Chinese character encoding issues
+        QMAKE_CFLAGS += -std=c99 -finput-charset=UTF-8 -fexec-charset=UTF-8
+        QMAKE_CXXFLAGS += -std=c++11 -finput-charset=UTF-8 -fexec-charset=UTF-8
+        
         if (contains(DEFINES, WIN64)) {
             DESTDIR = $$_PRO_FILE_PWD_/bin/mingw64
             LIBS += -L$$_PRO_FILE_PWD_/3rd/lib/mingw64
@@ -257,9 +263,9 @@ unix {
             -lswscale       \
             -lavutil        \
 
-
-    QMAKE_CFLAGS += -std=c99
-    QMAKE_CXXFLAGS += -std=c++11
+    # Fix Chinese character encoding issues
+    QMAKE_CFLAGS += -std=c99 -finput-charset=UTF-8 -fexec-charset=UTF-8
+    QMAKE_CXXFLAGS += -std=c++11 -finput-charset=UTF-8 -fexec-charset=UTF-8
 
     linux-g++ {
         DESTDIR = $$_PRO_FILE_PWD_/bin/linux
