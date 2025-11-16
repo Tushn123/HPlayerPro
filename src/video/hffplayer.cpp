@@ -13,10 +13,11 @@ extern "C"{
 #include <cstring>
 #include <cmath>
 
-#define DEFAULT_BLOCK_TIMEOUT   10  // s
+#define DEFAULT_BLOCK_TIMEOUT   10  // 秒
 
 std::atomic_flag HFFPlayer::s_ffmpeg_init = ATOMIC_FLAG_INIT;
 
+// 列出设备
 static void list_devices() {
     AVFormatContext* fmt_ctx = avformat_alloc_context();
     AVDictionary* options = NULL;
@@ -37,86 +38,87 @@ static void list_devices() {
     av_dict_free(&options);
 }
 
+// 调试所有硬件解码器
 static void debug_all_hardware_decoders() {
     const AVCodec* codec = NULL;
     void* iter = NULL;
-    
-    hlogi("=== Available Hardware Decoders ===");
-    hlogi("FFmpeg version: %s", av_version_info());
-    
-    // List all hardware device types
-    hlogi("\n--- Supported Hardware Device Types ---");
+
+    hlogi("=== 可用的硬件解码器 ===");
+    hlogi("FFmpeg 版本: %s", av_version_info());
+
+    // 列出所有硬件设备类型
+    hlogi("\n--- 支持的硬件设备类型 ---");
     AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
     while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE) {
-        hlogi("  Hardware device: %s", av_hwdevice_get_type_name(type));
+        hlogi("  硬件设备: %s", av_hwdevice_get_type_name(type));
     }
-    
-    // List all hardware decoders
-    hlogi("\n--- Available Hardware Decoders ---");
+
+    // 列出所有硬件解码器
+    hlogi("\n--- 可用的硬件解码器 ---");
     int hw_decoder_count = 0;
     while ((codec = av_codec_iterate(&iter))) {
         if (av_codec_is_decoder(codec)) {
-            // Check if it's a hardware decoder by name suffix
+            // 通过名称后缀检查是否是硬件解码器
             const char* name = codec->name;
             bool is_hw = false;
-            
-            if (strstr(name, "_cuvid") || strstr(name, "_qsv") || 
+
+            if (strstr(name, "_cuvid") || strstr(name, "_qsv") ||
                 strstr(name, "_dxva2") || strstr(name, "_d3d11va") ||
                 strstr(name, "_videotoolbox") || strstr(name, "_vaapi") ||
                 strstr(name, "_vdpau") || strstr(name, "_mediacodec")) {
                 is_hw = true;
             }
-            
-            // Also check hardware capability flag
+
+            // 同时检查硬件能力标志
             if (codec->capabilities & AV_CODEC_CAP_HARDWARE) {
                 is_hw = true;
             }
-            
+
             if (is_hw) {
                 hw_decoder_count++;
-                hlogi("  [%d] Hardware decoder: %-25s (%s)", 
+                hlogi("  [%d] 硬件解码器: %-25s (%s)",
                       hw_decoder_count, codec->name, codec->long_name);
-                
-                // Check supported hardware configurations
+
+                // 检查支持的硬件配置
                 for (int i = 0; ; i++) {
                     const AVCodecHWConfig* config = avcodec_get_hw_config(codec, i);
                     if (!config) break;
-                    
+
                     const char* hw_type = av_hwdevice_get_type_name(config->device_type);
                     if (hw_type) {
-                        hlogi("      -> Supports device: %s (method: %d)", 
+                        hlogi("      -> 支持设备: %s (方法: %d)",
                               hw_type, config->methods);
                     }
                 }
             }
         }
     }
-    
+
     if (hw_decoder_count == 0) {
-        hlogi("  No hardware decoders found!");
-        hlogi("  Note: You may need to recompile FFmpeg with hardware acceleration support");
+        hlogi("  未找到硬件解码器!");
+        hlogi("  注意: 您可能需要重新编译FFmpeg以支持硬件加速");
     } else {
-        hlogi("\nTotal hardware decoders found: %d", hw_decoder_count);
+        hlogi("\n找到的硬件解码器总数: %d", hw_decoder_count);
     }
-    
-    hlogi("=== End of Hardware Decoder List ===\n");
+
+    hlogi("=== 硬件解码器列表结束 ===\n");
 }
 
-// NOTE: avformat_open_input,av_read_frame block
+// 注意: avformat_open_input,av_read_frame 会阻塞
 static int interrupt_callback(void* opaque) {
     if (opaque == NULL) return 0;
     HFFPlayer* player = (HFFPlayer*)opaque;
     if (player->quit ||
         time(NULL) - player->block_starttime > player->block_timeout) {
-        hlogi("interrupt quit=%d media.src=%s", player->quit, player->media.src.c_str());
+        hlogi("中断退出 quit=%d media.src=%s", player->quit, player->media.src.c_str());
         return 1;
     }
     return 0;
 }
 
 HFFPlayer::HFFPlayer()
-: HVideoPlayer()
-, HThread() {
+    : HVideoPlayer()
+    , HThread() {
     fmt_opts = NULL;
     codec_opts = NULL;
     fmt_ctx = NULL;
@@ -132,32 +134,32 @@ HFFPlayer::HFFPlayer()
     audio_buffer_size = 0;
     audio_channels = 0;
     audio_sample_rate = 0;
-    
-    // Initialize SDL audio
+
+    // 初始化SDL音频
     audio_dev_id = 0;
     audio_hw_buf_size = 0;
     audio_play_buf = NULL;
     audio_play_buf_size = 0;
     audio_play_buf_index = 0;
     hmutex_init(&audio_queue_mutex);
-    
-    // Initialize clocks
+
+    // 初始化时钟
     init_clock(&audio_clock);
     init_clock(&video_clock);
-    
-    // Read av_sync_type from config file
-    // 0=audio master (default), 1=video master, 2=external clock
+
+    // 从配置文件读取av_sync_type
+    // 0=音频主时钟(默认), 1=视频主时钟, 2=外部时钟
     std::string sync_type_str = g_confile->GetValue("av_sync_type", "video");
     if (sync_type_str == "video") {
-        av_sync_type = 1;  // Video master
+        av_sync_type = 1;  // 视频主时钟
     } else if (sync_type_str == "external") {
-        av_sync_type = 2;  // External clock
+        av_sync_type = 2;  // 外部时钟
     } else {
-        av_sync_type = 0;  // Audio master (default)
+        av_sync_type = 0;  // 音频主时钟(默认)
     }
-    hlogi("AV sync type: %d (%s)", av_sync_type, 
-          av_sync_type == 0 ? "audio master" : av_sync_type == 1 ? "video master" : "external");
-    
+    hlogi("AV同步类型: %d (%s)", av_sync_type,
+          av_sync_type == 0 ? "音频主时钟" : av_sync_type == 1 ? "视频主时钟" : "外部时钟");
+
     audio_diff_cum = 0;
     audio_diff_avg_coef = exp(log(0.01) / 20);
     audio_diff_avg_count = 0;
@@ -168,8 +170,8 @@ HFFPlayer::HFFPlayer()
     block_starttime = time(NULL);
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
     quit = 0;
-    
-    // Initialize thread synchronization
+
+    // 初始化线程同步
     hmutex_init(&decoder_mutex);
     hmutex_init(&audio_queue_mutex);
     hmutex_init(&format_mutex);
@@ -182,8 +184,8 @@ HFFPlayer::HFFPlayer()
         avformat_network_init();
         avdevice_register_all();
         list_devices();
-        
-        // Debug: List all available hardware decoders
+
+        // 调试: 列出所有可用的硬件解码器
         debug_all_hardware_decoders();
     }
 }
@@ -213,11 +215,11 @@ int HFFPlayer::open() {
 #endif
         ifmt = av_find_input_format(drive);
         if (ifmt == NULL) {
-            hloge("Can not find dshow");
+            hloge("找不到 dshow");
             return -5;
         }
     }
-        break;
+    break;
     case MEDIA_TYPE_FILE:
     case MEDIA_TYPE_NETWORK:
         ifile = media.src;
@@ -226,7 +228,7 @@ int HFFPlayer::open() {
         return -10;
     }
 
-    hlogi("ifile:%s", ifile.c_str());
+    hlogi("输入文件:%s", ifile.c_str());
     int ret = 0;
     fmt_ctx = avformat_alloc_context();
     if (fmt_ctx == NULL) {
@@ -236,7 +238,7 @@ int HFFPlayer::open() {
     }
     defer (if (ret != 0 && fmt_ctx) {avformat_free_context(fmt_ctx); fmt_ctx = NULL;})
 
-    if (media.type == MEDIA_TYPE_NETWORK) {
+        if (media.type == MEDIA_TYPE_NETWORK) {
         if (strncmp(media.src.c_str(), "rtsp:", 5) == 0) {
             std::string str = g_confile->GetValue("rtsp_transport", "video");
             if (strcmp(str.c_str(), "tcp") == 0 ||
@@ -244,7 +246,7 @@ int HFFPlayer::open() {
                 av_dict_set(&fmt_opts, "rtsp_transport", str.c_str(), 0);
             }
         }
-        av_dict_set(&fmt_opts, "stimeout", "5000000", 0);   // us
+        av_dict_set(&fmt_opts, "stimeout", "5000000", 0);   // 微秒
     }
     av_dict_set(&fmt_opts, "buffer_size", "2048000", 0);
     fmt_ctx->interrupt_callback.callback = interrupt_callback;
@@ -252,28 +254,28 @@ int HFFPlayer::open() {
     block_starttime = time(NULL);
     ret = avformat_open_input(&fmt_ctx, ifile.c_str(), (AVInputFormat*)ifmt, &fmt_opts);
     if (ret != 0) {
-        hloge("Open input file[%s] failed: %d", ifile.c_str(), ret);
+        hloge("打开输入文件[%s]失败: %d", ifile.c_str(), ret);
         return ret;
     }
     fmt_ctx->interrupt_callback.callback = NULL;
     defer (if (ret != 0 && fmt_ctx) {avformat_close_input(&fmt_ctx);})
 
-    ret = avformat_find_stream_info(fmt_ctx, NULL);
+        ret = avformat_find_stream_info(fmt_ctx, NULL);
     if (ret != 0) {
-        hloge("Can not find stream: %d", ret);
+        hloge("找不到流信息: %d", ret);
         return ret;
     }
-    hlogi("stream_num=%d", fmt_ctx->nb_streams);
+    hlogi("流数量=%d", fmt_ctx->nb_streams);
 
     video_stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     audio_stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     subtitle_stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_SUBTITLE, -1, -1, NULL, 0);
-    hlogi("video_stream_index=%d", video_stream_index);
-    hlogi("audio_stream_index=%d", audio_stream_index);
-    hlogi("subtitle_stream_index=%d", subtitle_stream_index);
+    hlogi("视频流索引=%d", video_stream_index);
+    hlogi("音频流索引=%d", audio_stream_index);
+    hlogi("字幕流索引=%d", subtitle_stream_index);
 
     if (video_stream_index < 0) {
-        hloge("Can not find video stream.");
+        hloge("找不到视频流.");
         ret = -20;
         return ret;
     }
@@ -281,44 +283,44 @@ int HFFPlayer::open() {
     AVStream* video_stream = fmt_ctx->streams[video_stream_index];
     video_time_base_num = video_stream->time_base.num;
     video_time_base_den = video_stream->time_base.den;
-    hlogi("video_stream time_base=%d/%d", video_stream->time_base.num, video_stream->time_base.den);
+    hlogi("视频流 time_base=%d/%d", video_stream->time_base.num, video_stream->time_base.den);
 
     AVCodecParameters* codec_param = video_stream->codecpar;
-    hlogi("codec_id=%d:%s", codec_param->codec_id, avcodec_get_name(codec_param->codec_id));
+    hlogi("编解码器ID=%d:%s", codec_param->codec_id, avcodec_get_name(codec_param->codec_id));
 
     const AVCodec* codec = NULL;
     if (decode_mode != SOFTWARE_DECODE) {
-try_hardware_decode:
+    try_hardware_decode:
         std::string codec_name(avcodec_get_name(codec_param->codec_id));
         std::string decoder_name;
         bool found = false;
-        
+
         if (decode_mode == HARDWARE_DECODE_AUTO) {
-            // Auto mode: try all hardware decoders by priority
-            // Windows priority: CUVID(NVIDIA) > QSV(Intel) > D3D11VA > DXVA2
+            // 自动模式: 按优先级尝试所有硬件解码器
+            // Windows优先级: CUVID(NVIDIA) > QSV(Intel) > D3D11VA > DXVA2
             const char* hw_suffixes[] = {"_cuvid", "_qsv", "_d3d11va", "_dxva2"};
             const char* hw_names[] = {"NVIDIA CUVID", "Intel QSV", "D3D11VA", "DXVA2"};
-            const int hw_modes[] = {HARDWARE_DECODE_CUVID, HARDWARE_DECODE_QSV, 
+            const int hw_modes[] = {HARDWARE_DECODE_CUVID, HARDWARE_DECODE_QSV,
                                     HARDWARE_DECODE_D3D11VA, HARDWARE_DECODE_DXVA2};
-            
+
             for (int i = 0; i < 4; ++i) {
                 decoder_name = codec_name + hw_suffixes[i];
                 codec = avcodec_find_decoder_by_name(decoder_name.c_str());
-                
+
                 if (codec != NULL) {
                     real_decode_mode = hw_modes[i];
-                    hlogi("Found hardware decoder: %s (%s)", decoder_name.c_str(), hw_names[i]);
+                    hlogi("找到硬件解码器: %s (%s)", decoder_name.c_str(), hw_names[i]);
                     found = true;
                     break;
                 } else {
-                    hlogi("Hardware decoder not available: %s (%s)", decoder_name.c_str(), hw_names[i]);
+                    hlogi("硬件解码器不可用: %s (%s)", decoder_name.c_str(), hw_names[i]);
                 }
             }
         } else {
-            // Manual mode: try specific decoder
+            // 手动模式: 尝试特定解码器
             const char* suffix = NULL;
             const char* hw_name = NULL;
-            
+
             if (decode_mode == HARDWARE_DECODE_CUVID) {
                 suffix = "_cuvid";
                 hw_name = "NVIDIA CUVID";
@@ -332,39 +334,39 @@ try_hardware_decode:
                 suffix = "_dxva2";
                 hw_name = "DXVA2";
             }
-            
+
             if (suffix != NULL) {
                 decoder_name = codec_name + suffix;
                 codec = avcodec_find_decoder_by_name(decoder_name.c_str());
-                
+
                 if (codec != NULL) {
                     real_decode_mode = decode_mode;
-                    hlogi("Found hardware decoder: %s (%s)", decoder_name.c_str(), hw_name);
+                    hlogi("找到硬件解码器: %s (%s)", decoder_name.c_str(), hw_name);
                     found = true;
                 } else {
-                    hlogi("Hardware decoder not available: %s (%s)", decoder_name.c_str(), hw_name);
+                    hlogi("硬件解码器不可用: %s (%s)", decoder_name.c_str(), hw_name);
                 }
             }
         }
-        
+
         if (!found) {
-            hlogi("No hardware decoder found, will try software decode");
+            hlogi("未找到硬件解码器，将尝试软件解码");
         }
     }
 
     if (codec == NULL) {
-try_software_decode:
+    try_software_decode:
         codec = avcodec_find_decoder(codec_param->codec_id);
         if (codec == NULL) {
-            hloge("Can not find decoder %s", avcodec_get_name(codec_param->codec_id));
+            hloge("找不到解码器 %s", avcodec_get_name(codec_param->codec_id));
             ret = -30;
             return ret;
         }
         real_decode_mode = SOFTWARE_DECODE;
-        hlogi("Using software decoder: %s", codec->name);
+        hlogi("使用软件解码器: %s", codec->name);
     }
 
-    hlogi("codec_name: %s=>%s", codec->name, codec->long_name);
+    hlogi("编解码器名称: %s=>%s", codec->name, codec->long_name);
 
     codec_ctx = avcodec_alloc_context3(codec);
     if (codec_ctx == NULL) {
@@ -374,9 +376,9 @@ try_software_decode:
     }
     defer (if (ret != 0 && codec_ctx) {avcodec_free_context(&codec_ctx); codec_ctx = NULL;})
 
-    ret = avcodec_parameters_to_context(codec_ctx, codec_param);
+        ret = avcodec_parameters_to_context(codec_ctx, codec_param);
     if (ret != 0) {
-        hloge("avcodec_parameters_to_context error: %d", ret);
+        hloge("avcodec_parameters_to_context 错误: %d", ret);
         return ret;
     }
 
@@ -386,41 +388,41 @@ try_software_decode:
     ret = avcodec_open2(codec_ctx, codec, &codec_opts);
     if (ret != 0) {
         if (real_decode_mode != SOFTWARE_DECODE) {
-            hlogi("Can not open hardware codec error: %d, try software codec.", ret);
-            // Clean up failed hardware decoder context
+            hlogi("无法打开硬件编解码器 错误: %d, 尝试软件编解码器.", ret);
+            // 清理失败的硬件解码器上下文
             avcodec_free_context(&codec_ctx);
             codec_ctx = NULL;
-            // Find software decoder
+            // 查找软件解码器
             codec = avcodec_find_decoder(codec_param->codec_id);
             if (codec == NULL) {
-                hloge("Can not find software decoder %s", avcodec_get_name(codec_param->codec_id));
+                hloge("找不到软件解码器 %s", avcodec_get_name(codec_param->codec_id));
                 ret = -30;
                 return ret;
             }
             real_decode_mode = SOFTWARE_DECODE;
-            hlogi("Using software decoder: %s", codec->name);
-            
-            // Reallocate decoder context
+            hlogi("使用软件解码器: %s", codec->name);
+
+            // 重新分配解码器上下文
             codec_ctx = avcodec_alloc_context3(codec);
             if (codec_ctx == NULL) {
                 hloge("avcodec_alloc_context3");
                 ret = -40;
                 return ret;
             }
-            
+
             ret = avcodec_parameters_to_context(codec_ctx, codec_param);
             if (ret != 0) {
-                hloge("avcodec_parameters_to_context error: %d", ret);
+                hloge("avcodec_parameters_to_context 错误: %d", ret);
                 return ret;
             }
-            
+
             ret = avcodec_open2(codec_ctx, codec, &codec_opts);
             if (ret != 0) {
-                hloge("Can not open software codec error: %d", ret);
+                hloge("无法打开软件编解码器 错误: %d", ret);
                 return ret;
             }
         } else {
-            hloge("Can not open software codec error: %d", ret);
+            hloge("无法打开软件编解码器 错误: %d", ret);
             return ret;
         }
     }
@@ -430,14 +432,14 @@ try_software_decode:
     sw = codec_ctx->width;
     sh = codec_ctx->height;
     src_pix_fmt = codec_ctx->pix_fmt;
-    hlogi("sw=%d sh=%d src_pix_fmt=%d:%s", sw, sh, src_pix_fmt, av_get_pix_fmt_name(src_pix_fmt));
+    hlogi("源宽度=%d 源高度=%d 源像素格式=%d:%s", sw, sh, src_pix_fmt, av_get_pix_fmt_name(src_pix_fmt));
     if (sw <= 0 || sh <= 0 || src_pix_fmt == AV_PIX_FMT_NONE) {
-        hloge("Codec parameters wrong!");
+        hloge("编解码器参数错误!");
         ret = -45;
         return ret;
     }
 
-    dw = sw >> 2 << 2; // align = 4
+    dw = sw >> 2 << 2; // 对齐 = 4
     dh = sh;
     dst_pix_fmt = AV_PIX_FMT_YUV420P;
     std::string str = g_confile->GetValue("dst_pix_fmt", "video");
@@ -449,7 +451,7 @@ try_software_decode:
             dst_pix_fmt = AV_PIX_FMT_BGR24;
         }
     }
-    hlogi("dw=%d dh=%d dst_pix_fmt=%d:%s", dw, dh, dst_pix_fmt, av_get_pix_fmt_name(dst_pix_fmt));
+    hlogi("目标宽度=%d 目标高度=%d 目标像素格式=%d:%s", dw, dh, dst_pix_fmt, av_get_pix_fmt_name(dst_pix_fmt));
 
     sws_ctx = sws_getContext(sw, sh, src_pix_fmt, dw, dh, dst_pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
     if (sws_ctx == NULL) {
@@ -457,8 +459,8 @@ try_software_decode:
         ret = -50;
         return ret;
     }
-    
-    // Reset flag to check format on first decoded frame
+
+    // 重置标志，在第一个解码帧上检查格式
     sws_ctx_checked = false;
 
     packet = av_packet_alloc();
@@ -489,7 +491,7 @@ try_software_decode:
         linesize[0] = dw * 3;
     }
 
-    // HVideoPlayer member vars
+    // HVideoPlayer 成员变量
     if (video_stream->avg_frame_rate.num && video_stream->avg_frame_rate.den) {
         fps = video_stream->avg_frame_rate.num / video_stream->avg_frame_rate.den;
     }
@@ -507,87 +509,87 @@ try_software_decode:
             start_time = video_stream->start_time / (double)video_time_base_den * video_time_base_num * 1000;
         }
     }
-    hlogi("fps=%d duration=%lldms start_time=%lldms", fps, duration, start_time);
+    hlogi("帧率=%d 时长=%lld毫秒 开始时间=%lld毫秒", fps, duration, start_time);
 
-    // Initialize audio decoder if audio stream exists
+    // 如果存在音频流，初始化音频解码器
     if (audio_stream_index >= 0) {
         AVStream* audio_stream = fmt_ctx->streams[audio_stream_index];
         audio_time_base_num = audio_stream->time_base.num;
         audio_time_base_den = audio_stream->time_base.den;
-        hlogi("audio_stream time_base=%d/%d", audio_stream->time_base.num, audio_stream->time_base.den);
+        hlogi("音频流 time_base=%d/%d", audio_stream->time_base.num, audio_stream->time_base.den);
 
         AVCodecParameters* audio_codec_param = audio_stream->codecpar;
-        hlogi("audio_codec_id=%d:%s", audio_codec_param->codec_id, avcodec_get_name(audio_codec_param->codec_id));
-        
+        hlogi("音频编解码器ID=%d:%s", audio_codec_param->codec_id, avcodec_get_name(audio_codec_param->codec_id));
+
         const AVCodec* audio_codec = avcodec_find_decoder(audio_codec_param->codec_id);
         if (audio_codec == NULL) {
-            hloge("Can not find audio decoder %s", avcodec_get_name(audio_codec_param->codec_id));
-            // Audio is optional, continue without it
+            hloge("找不到音频解码器 %s", avcodec_get_name(audio_codec_param->codec_id));
+            // 音频是可选的，继续但没有音频
         } else {
-            hlogi("audio_codec_name: %s=>%s", audio_codec->name, audio_codec->long_name);
-            
+            hlogi("音频编解码器名称: %s=>%s", audio_codec->name, audio_codec->long_name);
+
             audio_codec_ctx = avcodec_alloc_context3(audio_codec);
             if (audio_codec_ctx == NULL) {
-                hloge("avcodec_alloc_context3 for audio failed");
+                hloge("音频解码器 avcodec_alloc_context3 失败");
             } else {
                 ret = avcodec_parameters_to_context(audio_codec_ctx, audio_codec_param);
                 if (ret != 0) {
-                    hloge("avcodec_parameters_to_context for audio error: %d", ret);
+                    hloge("音频解码器 avcodec_parameters_to_context 错误: %d", ret);
                     avcodec_free_context(&audio_codec_ctx);
                     audio_codec_ctx = NULL;
                 } else {
                     ret = avcodec_open2(audio_codec_ctx, audio_codec, NULL);
                     if (ret != 0) {
-                        hloge("Can not open audio codec error: %d", ret);
+                        hloge("无法打开音频编解码器 错误: %d", ret);
                         avcodec_free_context(&audio_codec_ctx);
                         audio_codec_ctx = NULL;
                     } else {
                         audio_stream->discard = AVDISCARD_DEFAULT;
                         audio_frame = av_frame_alloc();
-                        
-                        // Initialize audio resampler for PCM S16LE stereo output
+
+                        // 为PCM S16LE立体声输出初始化音频重采样器
                         audio_channels = 2;
                         audio_sample_rate = 44100;
-                        
-                        // Use newer channel layout API if available
+
+                        // 如果可用，使用新的声道布局API
                         int64_t in_ch_layout = AV_CH_LAYOUT_STEREO;
                         if (audio_codec_ctx->channel_layout) {
                             in_ch_layout = audio_codec_ctx->channel_layout;
                         } else if (audio_codec_ctx->channels > 0) {
                             in_ch_layout = av_get_default_channel_layout(audio_codec_ctx->channels);
                         }
-                        
+
                         swr_ctx = swr_alloc_set_opts(NULL,
-                            AV_CH_LAYOUT_STEREO,          // out_ch_layout
-                            AV_SAMPLE_FMT_S16,            // out_sample_fmt
-                            audio_sample_rate,            // out_sample_rate
-                            in_ch_layout,                 // in_ch_layout
-                            audio_codec_ctx->sample_fmt,  // in_sample_fmt
-                            audio_codec_ctx->sample_rate, // in_sample_rate
-                            0, NULL);
-                        
+                                                     AV_CH_LAYOUT_STEREO,          // 输出声道布局
+                                                     AV_SAMPLE_FMT_S16,            // 输出采样格式
+                                                     audio_sample_rate,            // 输出采样率
+                                                     in_ch_layout,                 // 输入声道布局
+                                                     audio_codec_ctx->sample_fmt,  // 输入采样格式
+                                                     audio_codec_ctx->sample_rate, // 输入采样率
+                                                     0, NULL);
+
                         if (swr_ctx) {
                             ret = swr_init(swr_ctx);
                             if (ret < 0) {
-                                hloge("swr_init failed: %d", ret);
+                                hloge("swr_init 失败: %d", ret);
                                 swr_free(&swr_ctx);
                                 swr_ctx = NULL;
                             } else {
-                                // Allocate audio output buffer
-                                audio_buffer_size = av_samples_get_buffer_size(NULL, audio_channels, 
-                                    audio_codec_ctx->frame_size > 0 ? audio_codec_ctx->frame_size : 1024, 
-                                    AV_SAMPLE_FMT_S16, 1);
+                                // 分配音频输出缓冲区
+                                audio_buffer_size = av_samples_get_buffer_size(NULL, audio_channels,
+                                                                               audio_codec_ctx->frame_size > 0 ? audio_codec_ctx->frame_size : 1024,
+                                                                               AV_SAMPLE_FMT_S16, 1);
                                 audio_buffer = (uint8_t*)av_malloc(audio_buffer_size);
-                                
-                                hlogi("Audio decoder initialized: channels=%d, sample_rate=%d", 
-                                    audio_channels, audio_sample_rate);
-                                
-                                // Open SDL audio device
+
+                                hlogi("音频解码器已初始化: 声道数=%d, 采样率=%d",
+                                      audio_channels, audio_sample_rate);
+
+                                // 打开SDL音频设备
                                 if (audio_open() < 0) {
-                                    hloge("Failed to open SDL audio device");
-                                    // Continue without audio
+                                    hloge("打开SDL音频设备失败");
+                                    // 继续但没有音频
                                 } else {
-                                    hlogi("SDL audio device opened successfully");
+                                    hlogi("SDL音频设备成功打开");
                                 }
                             }
                         }
@@ -597,9 +599,9 @@ try_software_decode:
         }
     }
 
-    // If no audio, use video as master clock
+    // 如果没有音频，使用视频作为主时钟
     if (audio_stream_index < 0 || !audio_codec_ctx || audio_dev_id == 0) {
-        hlogi("No audio stream or audio initialization failed, using video clock as master");
+        hlogi("没有音频流或音频初始化失败，使用视频时钟作为主时钟");
     }
 
     HThread::setSleepPolicy(HThread::SLEEP_UNTIL, 1000 / fps);
@@ -607,9 +609,9 @@ try_software_decode:
 }
 
 int HFFPlayer::close() {
-    // Close SDL audio first
+    // 首先关闭SDL音频
     audio_close();
-    
+
     if (fmt_opts) {
         av_dict_free(&fmt_opts);
         fmt_opts = NULL;
@@ -677,57 +679,57 @@ int HFFPlayer::close() {
 }
 
 void HFFPlayer::flushDecoders() {
-    // NOTE: This function should be called with decoder_mutex locked
-    // Flush video decoder
+    // 注意: 此函数应在 decoder_mutex 锁定时调用
+    // 刷新视频解码器
     if (codec_ctx) {
         avcodec_flush_buffers(codec_ctx);
-        hlogi("Video decoder flushed");
+        hlogi("视频解码器已刷新");
     }
-    
-    // Flush audio decoder
+
+    // 刷新音频解码器
     if (audio_codec_ctx) {
         avcodec_flush_buffers(audio_codec_ctx);
-        hlogi("Audio decoder flushed");
+        hlogi("音频解码器已刷新");
     }
-    
-    // Reset clocks
+
+    // 重置时钟
     init_clock(&audio_clock);
     init_clock(&video_clock);
 }
 
 int HFFPlayer::seek(int64_t ms) {
-    // Default: fast seek (to keyframe)
+    // 默认: 快速定位(到关键帧)
     return seek(ms, false);
 }
 
 int HFFPlayer::seek(int64_t ms, bool accurate) {
     if (!fmt_ctx) {
-        hloge("seek failed: fmt_ctx is NULL");
+        hloge("定位失败: fmt_ctx 为 NULL");
         return -1;
     }
-    
+
     const char* seek_mode = accurate ? "accurate" : "fast";
-    hlogi("seek=>%lldms (mode=%s, duration=%lldms, start_time=%lldms)", 
+    hlogi("定位到=>%lld毫秒 (模式=%s, 时长=%lld毫秒, 开始时间=%lld毫秒)",
           ms, seek_mode, duration, start_time);
-    
-    // Check if seek position is valid
+
+    // 检查定位位置是否有效
     if (ms < 0) {
-        hlogw("seek position is negative, clamping to 0");
+        hlogw("定位位置为负数，钳制到0");
         ms = 0;
     }
-    
+
     if (duration > 0 && ms > duration) {
-        hlogw("seek position exceeds duration, clamping to duration");
+        hlogw("定位位置超过时长，钳制到时长");
         ms = duration;
     }
-    
-    // Set seeking flag to prevent decoder operations in worker thread
+
+    // 设置定位标志，防止工作线程中的解码器操作
     is_seeking.store(true);
-    
-    // Clear frame cache before seeking
+
+    // 定位前清除帧缓存
     clear_frame_cache();
-    
-    // Clear audio queue
+
+    // 清除音频队列
     hmutex_lock(&audio_queue_mutex);
     while (!audio_frame_queue.empty()) {
         AudioFrame* af = audio_frame_queue.front();
@@ -735,159 +737,159 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
         delete af;
     }
     hmutex_unlock(&audio_queue_mutex);
-    
-    // Reset playback buffer
+
+    // 重置播放缓冲区
     audio_play_buf_index = 0;
     audio_play_buf_size = 0;
-    
-    // Reset EOF flag
+
+    // 重置EOF标志
     eof = 0;
     error = 0;
-    
+
     int ret = 0;
     int64_t seek_target = 0;
     int seek_flags = AVSEEK_FLAG_BACKWARD;
-    
-    // For accurate seek, we'll still seek to keyframe but decode frames until target
-    // For fast seek, we just seek to nearest keyframe
+
+    // 对于精确定位，我们仍然定位到关键帧但解码帧直到目标
+    // 对于快速定位，我们只定位到最近的关键帧
     if (accurate) {
-        // In accurate mode, we may want to seek slightly before target
-        // to ensure we can decode to exact frame
-        hlogi("Accurate seek mode: will decode to exact position");
+        // 在精确模式下，我们可能希望在目标之前稍微定位
+        // 以确保我们可以解码到精确的帧
+        hlogi("精确定位模式: 将解码到精确位置");
     }
-    
-    // Lock format_mutex to prevent concurrent access with doTask()
+
+    // 锁定 format_mutex 以防止与 doTask() 的并发访问
     hmutex_lock(&format_mutex);
-    
-    // Try to seek using video stream timestamp (more accurate)
+
+    // 尝试使用视频流时间戳定位(更准确)
     if (video_stream_index >= 0 && video_time_base_num && video_time_base_den) {
-        // Calculate target timestamp in stream timebase
+        // 以流时间基计算目标时间戳
         seek_target = (start_time + ms) / 1000.0 / video_time_base_num * video_time_base_den;
-        
-        hlogi("Seeking video stream: target_ms=%lld, start_time=%lld, timestamp=%lld", 
+
+        hlogi("定位视频流: target_ms=%lld, start_time=%lld, timestamp=%lld",
               ms, start_time, seek_target);
-        
+
         ret = av_seek_frame(fmt_ctx, video_stream_index, seek_target, seek_flags);
-        
+
         if (ret < 0) {
-            hloge("av_seek_frame failed for video stream: %d", ret);
-            // Try seeking without stream index (let FFmpeg choose the best stream)
-            seek_target = (start_time + ms) * 1000; // in microseconds (AV_TIME_BASE)
+            hloge("视频流 av_seek_frame 失败: %d", ret);
+            // 尝试不使用流索引定位(让FFmpeg选择最佳流)
+            seek_target = (start_time + ms) * 1000; // 以微秒为单位 (AV_TIME_BASE)
             ret = av_seek_frame(fmt_ctx, -1, seek_target, seek_flags);
-            
+
             if (ret < 0) {
-                hloge("av_seek_frame failed for any stream: %d", ret);
-                hmutex_unlock(&format_mutex);  // Unlock before returning
-                is_seeking.store(false);  // Clear flag before returning
+                hloge("任何流 av_seek_frame 失败: %d", ret);
+                hmutex_unlock(&format_mutex);  // 返回前解锁
+                is_seeking.store(false);  // 返回前清除标志
                 return ret;
             } else {
-                hlogi("Seek succeeded using default stream selection");
+                hlogi("使用默认流选择定位成功");
             }
         } else {
-            hlogi("Video stream seek succeeded");
+            hlogi("视频流定位成功");
         }
     } else {
-        // No video stream or timebase not set, use default timestamp
-        seek_target = (start_time + ms) * 1000; // in microseconds (AV_TIME_BASE)
-        hlogi("Seeking with default timebase: target_ms=%lld, timestamp=%lld", ms, seek_target);
-        
+        // 没有视频流或时间基未设置，使用默认时间戳
+        seek_target = (start_time + ms) * 1000; // 以微秒为单位 (AV_TIME_BASE)
+        hlogi("使用默认时间基准位: target_ms=%lld, timestamp=%lld", ms, seek_target);
+
         ret = av_seek_frame(fmt_ctx, -1, seek_target, seek_flags);
-        
+
         if (ret < 0) {
-            hloge("av_seek_frame failed: %d", ret);
-            hmutex_unlock(&format_mutex);  // Unlock before returning
-            is_seeking.store(false);  // Clear flag before returning
+            hloge("av_seek_frame 失败: %d", ret);
+            hmutex_unlock(&format_mutex);  // 返回前解锁
+            is_seeking.store(false);  // 返回前清除标志
             return ret;
         }
     }
-    
+
     hmutex_unlock(&format_mutex);
-    
-    // Lock decoder mutex before flushing
+
+    // 刷新前锁定解码器互斥锁
     hmutex_lock(&decoder_mutex);
-    
-    // Flush decoders to clear buffered frames
+
+    // 刷新解码器以清除缓冲的帧
     flushDecoders();
-    
+
     hmutex_unlock(&decoder_mutex);
-    
-    // Optionally seek audio stream if it exists and has different timebase
+
+    // 如果存在音频流且具有不同的时间基，可选地定位音频流
     if (audio_stream_index >= 0 && audio_time_base_num && audio_time_base_den) {
-        // Audio stream will be synchronized automatically during playback
-        // But we can log the expected audio timestamp
+        // 音频流将在播放期间自动同步
+        // 但我们可以记录预期的音频时间戳
         int64_t audio_seek_target = (start_time + ms) / 1000.0 / audio_time_base_num * audio_time_base_den;
-        hlogi("Audio stream expected timestamp: %lld", audio_seek_target);
+        hlogi("音频流预期时间戳: %lld", audio_seek_target);
     }
-    
-    // Clear seeking flag
+
+    // 清除定位标志
     is_seeking.store(false);
-    
-    hlogi("Seek completed successfully to %lldms (mode=%s)", ms, seek_mode);
+
+    hlogi("定位到 %lldms 成功 (模式=%s)", ms, seek_mode);
     return 0;
 }
 
 int HFFPlayer::seekByPercent(double percent) {
     if (duration <= 0) {
-        hloge("seekByPercent failed: duration is not available");
+        hloge("seekByPercent 失败: 时长不可用");
         return -1;
     }
-    
-    // Clamp percent to valid range
+
+    // 将百分比钳制到有效范围
     if (percent < 0.0) {
         percent = 0.0;
     } else if (percent > 100.0) {
         percent = 100.0;
     }
-    
-    // Calculate target position in milliseconds
+
+    // 以毫秒计算目标位置
     int64_t target_ms = (int64_t)(duration * percent / 100.0);
-    
-    hlogi("seekByPercent: %.2f%% => %lldms (duration=%lldms)", percent, target_ms, duration);
-    
+
+    hlogi("按百分比定位: %.2f%% => %lld毫秒 (时长=%lld毫秒)", percent, target_ms, duration);
+
     return seek(target_ms);
 }
 
 int HFFPlayer::seekRelative(int64_t offset_ms) {
     int64_t current_pos = getCurrentPosition();
-    
+
     if (current_pos < 0) {
-        hloge("seekRelative failed: cannot determine current position");
+        hloge("相对定位失败: 无法确定当前位置");
         return -1;
     }
-    
+
     int64_t target_ms = current_pos + offset_ms;
-    
-    hlogi("seekRelative: current=%lldms, offset=%lldms => target=%lldms", 
+
+    hlogi("相对定位: 当前=%lld毫秒, 偏移=%lld毫秒 => 目标=%lld毫秒",
           current_pos, offset_ms, target_ms);
-    
+
     return seek(target_ms);
 }
 
 int64_t HFFPlayer::getCurrentPosition() {
-    // Use the timestamp from the last decoded frame
+    // 使用最后解码帧的时间戳
     if (hframe.ts >= 0) {
-        // hframe.ts is already in milliseconds
+        // hframe.ts 已经是毫秒
         return hframe.ts;
     }
-    
-    // If no frame has been decoded yet, return 0
+
+    // 如果还没有解码任何帧，返回0
     return 0;
 }
 
 void HFFPlayer::set_speed(double speed) {
-    // Call base class to set playback_speed
+    // 调用基类设置播放速度
     HVideoPlayer::set_speed(speed);
-    
-    // CRITICAL: Adjust decode thread sleep time for HFFPlayer architecture
-    // Unlike ffplay which uses Clock in display loop, HFFPlayer controls
-    // frame rate via thread sleep policy
+
+    // 关键: 为 HFFPlayer 架构调整解码线程睡眠时间
+    // 与 ffplay 在显示循环中使用 Clock 不同，HFFPlayer 通过
+    // 线程睡眠策略控制帧率
     if (fps > 0 && speed > 0.0) {
         int sleep_ms = (int)((1000.0 / fps) / speed);
-        if (sleep_ms < 1) sleep_ms = 1;  // Minimum 1ms
+        if (sleep_ms < 1) sleep_ms = 1;  // 最小1毫秒
         HThread::setSleepPolicy(HThread::SLEEP_UNTIL, sleep_ms);
-        hlogi("Playback speed set to %.2fx (decode sleep: %dms)", speed, sleep_ms);
+        hlogi("播放速度设置为 %.2fx (解码睡眠: %d毫秒)", speed, sleep_ms);
     } else {
-        hlogi("Playback speed set to %.2fx (no sleep adjustment)", speed);
+        hlogi("播放速度设置为 %.2fx (无睡眠调整)", speed);
     }
 }
 
@@ -913,84 +915,84 @@ bool HFFPlayer::doFinish() {
 }
 
 int HFFPlayer::processVideoPacket() {
-    // Skip processing if seeking is in progress
+    // 如果正在定位，跳过处理
     if (is_seeking.load()) {
         return AVERROR(EAGAIN);
     }
-    
-    // Lock decoder mutex to prevent race condition with seek operation
+
+    // 锁定解码器互斥锁以防止与定位操作的竞争条件
     hmutex_lock(&decoder_mutex);
-    
-    // Double check seeking flag after acquiring lock
+
+    // 获取锁后再次检查定位标志
     if (is_seeking.load()) {
         hmutex_unlock(&decoder_mutex);
         return AVERROR(EAGAIN);
     }
-    
+
     int ret = avcodec_send_packet(codec_ctx, packet);
     if (ret != 0) {
         hmutex_unlock(&decoder_mutex);
-        hloge("avcodec_send_packet error: %d", ret);
+        hloge("avcodec_send_packet 错误: %d", ret);
         return ret;
     }
-    
+
     ret = avcodec_receive_frame(codec_ctx, frame);
     if (ret != 0) {
         hmutex_unlock(&decoder_mutex);
         if (ret == AVERROR(EAGAIN)) {
-            return ret;  // Need more packets
+            return ret;  // 需要更多数据包
         }
-        hloge("avcodec_receive_frame error: %d", ret);
+        hloge("avcodec_receive_frame 错误: %d", ret);
         return ret;
     }
-    
+
     hmutex_unlock(&decoder_mutex);
 
-    // On first decoded frame, verify/recreate sws_ctx with actual frame format
+    // 在第一个解码帧上，验证/重新创建具有实际帧格式的 sws_ctx
     if (!sws_ctx_checked) {
         sws_ctx_checked = true;
-        
+
         AVPixelFormat actual_fmt = (AVPixelFormat)frame->format;
-        
-        // Check if frame format matches what sws_ctx expects
+
+        // 检查帧格式是否与 sws_ctx 期望的匹配
         if (actual_fmt != src_pix_fmt || frame->width != width || frame->height != height) {
-            hlogi("Frame format mismatch detected! Recreating sws_ctx...");
-            hlogi("Expected: %dx%d fmt=%s(%d)", width, height, 
+            hlogi("检测到帧格式不匹配! 重新创建 sws_ctx...");
+            hlogi("预期: %dx%d 格式=%s(%d)", width, height,
                   av_get_pix_fmt_name(src_pix_fmt), src_pix_fmt);
-            hlogi("Actual: %dx%d fmt=%s(%d)", frame->width, frame->height,
+            hlogi("实际: %dx%d 格式=%s(%d)", frame->width, frame->height,
                   av_get_pix_fmt_name(actual_fmt), actual_fmt);
-            
-            // Free old sws_ctx
+
+            // 释放旧的 sws_ctx
             if (sws_ctx) {
                 sws_freeContext(sws_ctx);
                 sws_ctx = NULL;
             }
-            
-            // Update stored values
+
+            // 更新存储的值
             width = frame->width;
             height = frame->height;
             src_pix_fmt = actual_fmt;
-            
-            // Recreate with actual frame parameters
-            int dw = frame->width >> 2 << 2;  // align to 4
+
+            // 使用实际帧参数重新创建
+            int dw = frame->width >> 2 << 2;  // 对齐到4
             int dh = frame->height;
-            
+
             sws_ctx = sws_getContext(
-                frame->width, frame->height, actual_fmt,  // actual source
-                dw, dh, dst_pix_fmt,                      // destination
+                frame->width, frame->height, actual_fmt,  // 实际源
+                dw, dh, dst_pix_fmt,                      // 目标
                 SWS_BICUBIC, NULL, NULL, NULL);
-            
+
             if (!sws_ctx) {
-                hloge("Failed to recreate sws_ctx!");
+                hloge("重新创建 sws_ctx 失败!");
                 return -1;
             }
-            
-            // Update hframe dimensions
+
+            // 更新 hframe 尺寸
             hframe.w = dw;
             hframe.h = dh;
             hframe.buf.resize(dw * dh * 4);
-            
-            // Update data buffers for new dimensions
+
+            // 为新尺寸更新数据缓冲区
             if (dst_pix_fmt == AV_PIX_FMT_YUV420P) {
                 data[0] = (uint8_t*)hframe.buf.base;
                 data[1] = data[0] + dw * dh;
@@ -1002,73 +1004,73 @@ int HFFPlayer::processVideoPacket() {
                 data[0] = (uint8_t*)hframe.buf.base;
                 linesize[0] = dw * 3;
             }
-            
-            hlogi("sws_ctx recreated successfully: %dx%d %s -> %dx%d %s",
+
+            hlogi("sws_ctx 重新创建成功: %dx%d %s -> %dx%d %s",
                   frame->width, frame->height, av_get_pix_fmt_name(actual_fmt),
                   dw, dh, av_get_pix_fmt_name(dst_pix_fmt));
         } else {
-            hlogi("Frame format matches sws_ctx, no recreation needed");
+            hlogi("帧格式与 sws_ctx 匹配，无需重新创建");
         }
     }
 
     if (sws_ctx) {
         int h = sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, data, linesize);
         if (h <= 0) {
-            hloge("sws_scale failed! returned: %d, frame: %dx%d, format: %d(%s)", 
+            hloge("sws_scale 失败! 返回: %d, 帧: %dx%d, 格式: %d(%s)",
                   h, frame->width, frame->height, frame->format,
                   av_get_pix_fmt_name((AVPixelFormat)frame->format));
             return -1;
         }
         if (h != frame->height) {
-            hlogw("sws_scale returned different height: %d, expected: %d (continuing anyway)", 
+            hlogw("sws_scale 返回不同高度: %d, 预期: %d (继续)",
                   h, frame->height);
         }
     }
 
     if (video_time_base_num && video_time_base_den) {
-        // Calculate original timestamp (no speed adjustment needed for HFFPlayer)
-        // Speed control is handled by adjusting thread sleep time
+        // 计算原始时间戳(HFFPlayer 不需要速度调整)
+        // 速度控制通过调整线程睡眠时间处理
         hframe.ts = frame->pts / (double)video_time_base_den * video_time_base_num * 1000;
-        
-        // Update video clock for A/V sync
+
+        // 更新视频时钟用于音视频同步
         AVRational tb;
         tb.num = video_time_base_num;
         tb.den = video_time_base_den;
         double video_pts = frame->pts * av_q2d(tb);
-        
-        // Compute frame delay (duration)
+
+        // 计算帧延迟(持续时间)
         double delay = video_pts - frame_last_pts;
         if (delay <= 0 || delay > 1.0) {
-            // If delay is invalid, use last delay
+            // 如果延迟无效，使用最后延迟
             delay = frame_last_delay;
         }
-        
-        // Save for next frame
+
+        // 保存给下一帧
         frame_last_pts = video_pts;
         frame_last_delay = delay;
-        
-        // If not video master, adjust delay for sync
-        if (get_master_sync_type() != 1) {  // Not AV_SYNC_VIDEO_MASTER
+
+        // 如果不是视频主时钟，为同步调整延迟
+        if (get_master_sync_type() != 1) {  // 不是 AV_SYNC_VIDEO_MASTER
             delay = compute_target_delay(delay);
         }
-        
-        // Update frame timer
+
+        // 更新帧计时器
         double time = (double)av_gettime_relative() / 1000000.0;
         if (frame_timer == 0) {
             frame_timer = time;
         }
         frame_timer += delay;
-        
-        // Actual delay - sleep if we're ahead
+
+        // 实际延迟 - 如果我们领先则睡眠
         double actual_delay = frame_timer - time;
-        if (actual_delay > 0 && actual_delay < 1.0) {  // Max 1 second
+        if (actual_delay > 0 && actual_delay < 1.0) {  // 最大1秒
             int sleep_ms = (int)(actual_delay * 1000);
             if (sleep_ms > 0) {
                 msleep(sleep_ms);
             }
         }
-        
-        // Update video clock
+
+        // 更新视频时钟
         time = (double)av_gettime_relative() / 1000000.0;
         set_clock(&video_clock, video_pts, time);
     }
@@ -1079,18 +1081,18 @@ int HFFPlayer::processVideoPacket() {
 
 int HFFPlayer::processAudioPacket() {
     if (!audio_codec_ctx) {
-        return 0;  // No audio decoder initialized
+        return 0;  // 没有音频解码器初始化
     }
-    
-    // Skip processing if seeking is in progress
+
+    // 如果正在定位，跳过处理
     if (is_seeking.load()) {
         return AVERROR(EAGAIN);
     }
-    
-    // Lock decoder mutex to prevent race condition with seek operation
+
+    // 锁定解码器互斥锁以防止与定位操作的竞争条件
     hmutex_lock(&decoder_mutex);
-    
-    // Double check seeking flag after acquiring lock
+
+    // 获取锁后再次检查定位标志
     if (is_seeking.load()) {
         hmutex_unlock(&decoder_mutex);
         return AVERROR(EAGAIN);
@@ -1099,30 +1101,30 @@ int HFFPlayer::processAudioPacket() {
     int ret = avcodec_send_packet(audio_codec_ctx, packet);
     if (ret != 0) {
         hmutex_unlock(&decoder_mutex);
-        hloge("avcodec_send_packet (audio) error: %d", ret);
+        hloge("avcodec_send_packet (音频) 错误: %d", ret);
         return ret;
     }
-    
+
     ret = avcodec_receive_frame(audio_codec_ctx, audio_frame);
     if (ret != 0) {
         hmutex_unlock(&decoder_mutex);
         if (ret == AVERROR(EAGAIN)) {
-            return ret;  // Need more packets
+            return ret;  // 需要更多数据包
         }
-        hloge("avcodec_receive_frame (audio) error: %d", ret);
+        hloge("avcodec_receive_frame (音频) 错误: %d", ret);
         return ret;
     }
-    
+
     hmutex_unlock(&decoder_mutex);
 
-    // Resample audio if needed
+    // 如果需要，重采样音频
     if (swr_ctx && audio_buffer) {
         int out_samples = swr_convert(swr_ctx,
-            &audio_buffer, audio_frame->nb_samples,
-            (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
-        
+                                      &audio_buffer, audio_frame->nb_samples,
+                                      (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
+
         if (out_samples > 0) {
-            // Calculate PTS in seconds
+            // 以秒计算PTS
             double audio_pts = 0;
             if (audio_frame->pts != AV_NOPTS_VALUE && audio_time_base_num && audio_time_base_den) {
                 AVRational atb;
@@ -1130,8 +1132,8 @@ int HFFPlayer::processAudioPacket() {
                 atb.den = audio_time_base_den;
                 audio_pts = audio_frame->pts * av_q2d(atb);
             }
-            
-            // Create audio frame for queue
+
+            // 为队列创建音频帧
             AudioFrame* af = new AudioFrame();
             int data_size = out_samples * audio_channels * sizeof(int16_t);
             af->data = (uint8_t*)av_malloc(data_size);
@@ -1139,61 +1141,61 @@ int HFFPlayer::processAudioPacket() {
                 memcpy(af->data, audio_buffer, data_size);
                 af->size = data_size;
                 af->pts = audio_pts;
-                
-                // Push to queue
+
+                // 推送到队列
                 hmutex_lock(&audio_queue_mutex);
                 audio_frame_queue.push(af);
                 size_t queue_size = audio_frame_queue.size();
                 hmutex_unlock(&audio_queue_mutex);
-                
-                // Debug: Log first few frames
+
+                // 调试: 记录前几帧
                 static int audio_frame_count = 0;
                 if (audio_frame_count < 5) {
-                    hlogi("Audio frame queued #%d: size=%d, pts=%.3f, queue_size=%zu", 
+                    hlogi("音频帧入队 #%d: 大小=%d, pts=%.3f, 队列大小=%zu",
                           audio_frame_count++, data_size, audio_pts, queue_size);
                 }
             } else {
-                hloge("Failed to allocate audio frame buffer");
+                hloge("分配音频帧缓冲区失败");
                 delete af;
             }
         } else {
-            hloge("swr_convert returned 0 or negative samples: %d", out_samples);
+            hloge("swr_convert 返回0或负采样数: %d", out_samples);
         }
     } else {
-        if (!swr_ctx) hloge("swr_ctx is NULL");
-        if (!audio_buffer) hloge("audio_buffer is NULL");
+        if (!swr_ctx) hloge("swr_ctx 为 NULL");
+        if (!audio_buffer) hloge("audio_buffer 为 NULL");
     }
 
     return 0;
 }
 
 void HFFPlayer::doTask() {
-    // loop until get a video frame or process audio
+    // 循环直到获取视频帧或处理音频
     while (!quit) {
-        // av_init_packet is deprecated in FFmpeg 5.x, packet is already initialized by av_packet_alloc
+        // av_init_packet 在 FFmpeg 5.x 中已弃用，packet 已由 av_packet_alloc 初始化
 
-        // Lock format_mutex to prevent concurrent access with seek()
+        // 锁定 format_mutex 以防止与 seek() 的并发访问
         hmutex_lock(&format_mutex);
-        
-        // Check if seeking in progress
+
+        // 检查是否正在定位
         if (is_seeking.load()) {
             hmutex_unlock(&format_mutex);
-            msleep(10);  // Wait a bit for seek to complete
+            msleep(10);  // 等待定位完成
             continue;
         }
-        
+
         fmt_ctx->interrupt_callback.callback = interrupt_callback;
         fmt_ctx->interrupt_callback.opaque = this;
         block_starttime = time(NULL);
         //hlogi("av_read_frame");
         int ret = av_read_frame(fmt_ctx, packet);
-        //hlogi("av_read_frame retval=%d", ret);
+        //hlogi("av_read_frame 返回值=%d", ret);
         fmt_ctx->interrupt_callback.callback = NULL;
-        
+
         hmutex_unlock(&format_mutex);
-        
+
         if (ret != 0) {
-            hlogi("No frame: %d", ret);
+            hlogi("无帧: %d", ret);
             if (!quit) {
                 if (ret == AVERROR_EOF || avio_feof(fmt_ctx->pb)) {
                     eof = 1;
@@ -1207,38 +1209,38 @@ void HFFPlayer::doTask() {
             return;
         }
 
-        // NOTE: if not call av_packet_unref, memory leak.
+        // 注意: 如果不调用 av_packet_unref，内存泄漏。
         defer (av_packet_unref(packet);)
 
-        // hlogi("stream_index=%d data=%p len=%d", packet->stream_index, packet->data, packet->size);
-        
-        // Process video packet
-        if (packet->stream_index == video_stream_index) {
+            // hlogi("流索引=%d 数据=%p 长度=%d", packet->stream_index, packet->data, packet->size);
+
+            // 处理视频包
+            if (packet->stream_index == video_stream_index) {
             ret = processVideoPacket();
             if (ret == 0) {
-                // Successfully decoded a video frame, exit loop
+                // 成功解码视频帧，退出循环
                 break;
             }
             else if (ret != AVERROR(EAGAIN)) {
-                // Fatal error
+                // 致命错误
                 return;
             }
-            // EAGAIN means need more packets, continue reading
+            // EAGAIN 表示需要更多数据包，继续读取
         }
-        // Process audio packet
+        // 处理音频包
         else if (packet->stream_index == audio_stream_index) {
             ret = processAudioPacket();
             if (ret != 0 && ret != AVERROR(EAGAIN)) {
-                // Non-fatal audio error, log and continue
-                // Audio processing doesn't block video playback
+                // 非致命音频错误，记录并继续
+                // 音频处理不阻塞视频播放
             }
-            // Continue reading for video frame
+            // 继续读取视频帧
         }
-        // Skip other streams
+        // 跳过其他流
     }
 }
 
-// ==================== Clock Functions ====================
+// ==================== 时钟函数 ====================
 void HFFPlayer::init_clock(Clock* c) {
     c->pts = NAN;
     c->pts_drift = 0;
@@ -1262,29 +1264,29 @@ double HFFPlayer::get_clock(Clock* c) {
 }
 
 int HFFPlayer::get_master_sync_type() {
-    // If no audio stream, video must be master
+    // 如果没有音频流，视频必须是主时钟
     if (audio_stream_index < 0 || !audio_codec_ctx || audio_dev_id == 0) {
         return 1;  // AV_SYNC_VIDEO_MASTER
     }
-    
-    // If no video stream, audio must be master
+
+    // 如果没有视频流，音频必须是主时钟
     if (video_stream_index < 0) {
         return 0;  // AV_SYNC_AUDIO_MASTER
     }
-    
-    // Otherwise use configured type
+
+    // 否则使用配置的类型
     return av_sync_type;
 }
 
 double HFFPlayer::get_master_clock() {
     int sync_type = get_master_sync_type();
-    
+
     switch (sync_type) {
     case 1:  // AV_SYNC_VIDEO_MASTER
         return get_clock(&video_clock);
     case 2:  // AV_SYNC_EXTERNAL_CLOCK
-        // For now, external clock is same as audio clock
-        // In a full implementation, this would be a separate clock
+        // 目前，外部时钟与音频时钟相同
+        // 在完整实现中，这将是一个单独的时钟
         return get_clock(&audio_clock);
     case 0:  // AV_SYNC_AUDIO_MASTER
     default:
@@ -1293,86 +1295,86 @@ double HFFPlayer::get_master_clock() {
 }
 
 double HFFPlayer::compute_target_delay(double delay) {
-    // Reference: ffplay.c compute_target_delay()
-    // This function adjusts frame delay to sync video with master clock
-    
+    // 参考: ffplay.c compute_target_delay()
+    // 此函数调整帧延迟以将视频与主时钟同步
+
     double sync_threshold, diff = 0;
-    
-    // Get the difference between video clock and master clock
+
+    // 获取视频时钟和主时钟之间的差异
     diff = get_clock(&video_clock) - get_master_clock();
-    
-    // Compute sync threshold
+
+    // 计算同步阈值
     // AV_SYNC_THRESHOLD_MIN = 0.04, AV_SYNC_THRESHOLD_MAX = 0.1
     const double AV_SYNC_THRESHOLD_MIN = 0.04;
     const double AV_SYNC_THRESHOLD_MAX = 0.1;
     const double AV_SYNC_FRAMEDUP_THRESHOLD = 0.1;
     const double AV_NOSYNC_THRESHOLD = 10.0;
-    
-    sync_threshold = (delay > AV_SYNC_THRESHOLD_MAX) ? AV_SYNC_THRESHOLD_MAX : 
-                     (delay < AV_SYNC_THRESHOLD_MIN) ? AV_SYNC_THRESHOLD_MIN : delay;
-    
+
+    sync_threshold = (delay > AV_SYNC_THRESHOLD_MAX) ? AV_SYNC_THRESHOLD_MAX :
+                         (delay < AV_SYNC_THRESHOLD_MIN) ? AV_SYNC_THRESHOLD_MIN : delay;
+
     if (!std::isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD) {
         if (diff <= -sync_threshold) {
-            // Video is behind audio, speed up (reduce delay)
+            // 视频落后于音频，加速(减少延迟)
             delay = (delay + diff < 0) ? 0 : delay + diff;
         } else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD) {
-            // Video is ahead of audio, slow down (increase delay)
+            // 视频领先于音频，减速(增加延迟)
             delay = delay + diff;
         } else if (diff >= sync_threshold) {
-            // Video is ahead but delay is small, duplicate frame (2x delay)
+            // 视频领先但延迟很小，复制帧(2倍延迟)
             delay = 2 * delay;
         }
     }
-    
+
     static int log_count = 0;
     if (log_count < 5) {
-        hlogi("A-V sync: diff=%.3f, delay=%.3f->%.3f", -diff, frame_last_delay, delay);
+        hlogi("音视频同步: 差异=%.3f, 延迟=%.3f->%.3f", -diff, frame_last_delay, delay);
         log_count++;
     }
-    
+
     return delay;
 }
 
-// ==================== SDL Audio Functions ====================
+// ==================== SDL 音频函数 ====================
 void HFFPlayer::sdl_audio_callback(void* userdata, uint8_t* stream, int len) {
     HFFPlayer* player = (HFFPlayer*)userdata;
-    
+
     static int callback_count = 0;
     static bool first_call = true;
-    
+
     if (first_call) {
-        hlogi("SDL audio callback called for the first time, len=%d", len);
+        hlogi("SDL 音频回调首次调用, 长度=%d", len);
         first_call = false;
     }
-    
+
     memset(stream, 0, len);
-    
+
     if (player->quit || player->is_seeking.load()) {
         return;
     }
-    
+
     int total_written = 0;
     while (len > 0) {
         if (player->audio_play_buf_index >= player->audio_play_buf_size) {
-            // Need to decode more audio
+            // 需要解码更多音频
             double pts;
             int audio_size = player->audio_decode_frame(&pts);
-            
+
             if (audio_size < 0) {
-                // Error or no more frames, output silence
+                // 错误或无更多帧，输出静音
                 if (callback_count < 3) {
-                    hlogi("audio_decode_frame returned -1 (no frames in queue)");
+                    hlogi("audio_decode_frame 返回 -1 (队列中无帧)");
                 }
                 player->audio_play_buf = NULL;
                 player->audio_play_buf_size = 512;
             } else {
                 player->audio_play_buf_size = audio_size;
-                
+
                 if (callback_count < 3) {
-                    hlogi("Decoded audio frame: size=%d, pts=%.3f", audio_size, pts);
+                    hlogi("解码音频帧: 大小=%d, pts=%.3f", audio_size, pts);
                 }
-                
-                // Update audio clock
+
+                // 更新音频时钟
                 if (!std::isnan(pts)) {
                     double time = (double)av_gettime_relative() / 1000000.0;
                     player->set_clock(&player->audio_clock, pts, time);
@@ -1380,44 +1382,44 @@ void HFFPlayer::sdl_audio_callback(void* userdata, uint8_t* stream, int len) {
             }
             player->audio_play_buf_index = 0;
         }
-        
+
         int len1 = player->audio_play_buf_size - player->audio_play_buf_index;
         if (len1 > len)
             len1 = len;
-        
+
         if (player->audio_play_buf) {
             memcpy(stream, player->audio_play_buf + player->audio_play_buf_index, len1);
             total_written += len1;
         }
-        
+
         len -= len1;
         stream += len1;
         player->audio_play_buf_index += len1;
     }
-    
+
     if (callback_count < 3) {
-        hlogi("SDL callback #%d: wrote %d bytes", callback_count, total_written);
+        hlogi("SDL 回调 #%d: 写入 %d 字节", callback_count, total_written);
     }
     callback_count++;
 }
 
 int HFFPlayer::audio_decode_frame(double* pts_ptr) {
     hmutex_lock(&audio_queue_mutex);
-    
+
     if (audio_frame_queue.empty()) {
         hmutex_unlock(&audio_queue_mutex);
         return -1;
     }
-    
+
     AudioFrame* af = audio_frame_queue.front();
     audio_frame_queue.pop();
     hmutex_unlock(&audio_queue_mutex);
-    
+
     if (af && af->data && af->size > 0) {
         *pts_ptr = af->pts;
         int size = af->size;
-        
-        // Allocate or reallocate play buffer if needed
+
+        // 如果需要，分配或重新分配播放缓冲区
         if (!audio_play_buf || size > audio_buffer_size * 2) {
             if (audio_play_buf) {
                 av_free(audio_play_buf);
@@ -1428,14 +1430,14 @@ int HFFPlayer::audio_decode_frame(double* pts_ptr) {
                 return -1;
             }
         }
-        
-        // Copy audio data to play buffer
+
+        // 复制音频数据到播放缓冲区
         memcpy(audio_play_buf, af->data, size);
-        
-        delete af;  // Delete after copying
+
+        delete af;  // 复制后删除
         return size;
     }
-    
+
     if (af) {
         delete af;
     }
@@ -1443,69 +1445,69 @@ int HFFPlayer::audio_decode_frame(double* pts_ptr) {
 }
 
 int HFFPlayer::synchronize_audio(int nb_samples) {
-    // Simple version without tempo adjustment
-    // In a full implementation, this would adjust sample rate based on A/V diff
+    // 无速度调整的简单版本
+    // 在完整实现中，这将基于音视频差异调整采样率
     return nb_samples;
 }
 
 int HFFPlayer::audio_open() {
-    // Initialize SDL audio if not already done
+    // 如果尚未初始化，初始化SDL音频
     static bool sdl_audio_initialized = false;
     if (!sdl_audio_initialized) {
         if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-            hloge("Could not initialize SDL audio: %s", SDL_GetError());
+            hloge("无法初始化SDL音频: %s", SDL_GetError());
             return -1;
         }
         sdl_audio_initialized = true;
-        hlogi("SDL audio subsystem initialized");
+        hlogi("SDL音频子系统已初始化");
     }
-    
+
     SDL_AudioSpec wanted_spec, spec;
     memset(&wanted_spec, 0, sizeof(wanted_spec));
     memset(&spec, 0, sizeof(spec));
-    
+
     wanted_spec.freq = audio_sample_rate;
     wanted_spec.format = AUDIO_S16SYS;
     wanted_spec.channels = audio_channels;
     wanted_spec.silence = 0;
-    wanted_spec.samples = 1024;  // Buffer size
+    wanted_spec.samples = 1024;  // 缓冲区大小
     wanted_spec.callback = sdl_audio_callback;
     wanted_spec.userdata = this;
-    
-    hlogi("Opening SDL audio: freq=%d, channels=%d, format=S16", 
+
+    hlogi("打开SDL音频: 频率=%d, 声道数=%d, 格式=S16",
           wanted_spec.freq, wanted_spec.channels);
-    
+
     audio_dev_id = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-    
+
     if (audio_dev_id == 0) {
-        hloge("Failed to open audio device: %s", SDL_GetError());
+        hloge("打开音频设备失败: %s", SDL_GetError());
         return -1;
     }
-    
+
     audio_hw_buf_size = spec.size;
-    
-    hlogi("SDL audio opened successfully:");
-    hlogi("  Device ID: %d", audio_dev_id);
-    hlogi("  Frequency: %d Hz (wanted %d)", spec.freq, wanted_spec.freq);
-    hlogi("  Channels: %d (wanted %d)", spec.channels, wanted_spec.channels);
-    hlogi("  Samples: %d", spec.samples);
-    hlogi("  Buffer size: %d bytes", spec.size);
-    
-    // Start audio playback
+
+    hlogi("SDL音频成功打开:");
+    hlogi("  设备 ID: %d", audio_dev_id);
+    hlogi("  频率: %d Hz (期望 %d)", spec.freq, wanted_spec.freq);
+    hlogi("  声道数: %d (期望 %d)", spec.channels, wanted_spec.channels);
+    hlogi("  采样数: %d", spec.samples);
+    hlogi("  缓冲区大小: %d 字节", spec.size);
+
+    // 开始音频播放
     SDL_PauseAudioDevice(audio_dev_id, 0);
-    hlogi("SDL audio playback started");
-    
+    hlogi("SDL音频播放已开始");
+
     return 0;
 }
 
 void HFFPlayer::audio_close() {
     if (audio_dev_id) {
-        SDL_PauseAudioDevice(audio_dev_id, 1);  // Pause first
+        SDL_PauseAudioDevice(audio_dev_id, 1);  // 首先暂停
         SDL_CloseAudioDevice(audio_dev_id);
         audio_dev_id = 0;
     }
-    
-    // Clear audio queue
+
+    // 清除音频队列
     hmutex_lock(&audio_queue_mutex);
     while (!audio_frame_queue.empty()) {
         AudioFrame* af = audio_frame_queue.front();
@@ -1513,8 +1515,8 @@ void HFFPlayer::audio_close() {
         delete af;
     }
     hmutex_unlock(&audio_queue_mutex);
-    
-    // Free play buffer
+
+    // 释放播放缓冲区
     if (audio_play_buf) {
         av_free(audio_play_buf);
         audio_play_buf = NULL;
