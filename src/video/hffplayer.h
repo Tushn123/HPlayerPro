@@ -8,6 +8,9 @@
 #include "hmutex.h"
 
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <SDL2/SDL.h>
 #include <queue>
 
@@ -32,6 +35,28 @@ struct AudioFrame {
         if (data) {
             av_free(data);
         }
+    }
+};
+
+// Packet queue for multi-threaded decoding (C++11 standard library)
+struct PacketQueue {
+    std::queue<AVPacket*> packets;
+    std::mutex mutex;                    // C++11 标准互斥锁
+    std::condition_variable cond;        // C++11 标准条件变量
+    int nb_packets;                      // Number of packets in queue
+    int64_t size;                        // Total size in bytes
+    int64_t duration;                    // Total duration in stream timebase
+    std::atomic<bool> abort_request;     // Flag to abort blocking operations
+    
+    // Statistics (ffplay-style)
+    int max_nb_packets;                  // Peak packet count
+    int64_t max_size;                    // Peak size in bytes
+    uint64_t total_packets_put;          // Total packets ever put
+    uint64_t total_packets_get;          // Total packets ever got
+    
+    PacketQueue() : nb_packets(0), size(0), duration(0), abort_request(false),
+                    max_nb_packets(0), max_size(0), 
+                    total_packets_put(0), total_packets_get(0) {
     }
 };
 
@@ -76,11 +101,15 @@ public:
 
 private:
     virtual bool doPrepare();
-    virtual void doTask();
+    virtual void doTask();      // Video decoding thread
     virtual bool doFinish();
 
     int open();
     int close();
+    
+    // Multi-threaded architecture
+    void readTask();            // Packet reading thread (demuxer)
+    void audioTask();           // Audio decoding thread
 
 public:
     int64_t block_starttime;
@@ -131,7 +160,7 @@ private:
     SDL_AudioDeviceID audio_dev_id;
     int             audio_hw_buf_size;
     std::queue<AudioFrame*> audio_frame_queue;
-    hmutex_t        audio_queue_mutex;
+    std::mutex      audio_queue_mutex;      // C++11 标准互斥锁
     uint8_t*        audio_play_buf;
     int             audio_play_buf_size;
     int             audio_play_buf_index;
@@ -148,8 +177,17 @@ private:
     double          frame_last_delay;
 
     // processing functions
-    int processVideoPacket();
-    int processAudioPacket();
+    int processVideoPacket(AVPacket* pkt);
+    int processAudioPacket(AVPacket* pkt);
+    
+    // PacketQueue management functions (ffplay-style with condition variable)
+    int packet_queue_put(PacketQueue* q, AVPacket* pkt);
+    int packet_queue_get(PacketQueue* q, AVPacket* pkt, bool block);
+    void packet_queue_flush(PacketQueue* q);
+    void packet_queue_abort(PacketQueue* q);
+    void packet_queue_start(PacketQueue* q);  // Resume queue operations
+    int packet_queue_size(PacketQueue* q);
+    void packet_queue_print_stats(PacketQueue* q, const char* name);  // Print statistics
     
     // helper functions
     void flushDecoders();
@@ -169,10 +207,18 @@ private:
     int audio_decode_frame(double* pts_ptr);
     int synchronize_audio(int nb_samples);
     
-    // Thread synchronization
-    hmutex_t        decoder_mutex;       // Protects decoder operations
-    hmutex_t        format_mutex;        // Protects fmt_ctx operations (read/seek)
+    // Thread synchronization (C++11 standard library)
+    std::mutex      decoder_mutex;       // Protects decoder operations
+    std::mutex      format_mutex;        // Protects fmt_ctx operations (read/seek)
     std::atomic<bool> is_seeking;        // Flag to indicate seeking in progress
+    
+    // Multi-threaded packet queues (ffplay-style)
+    PacketQueue     video_packet_queue;
+    PacketQueue     audio_packet_queue;
+    std::thread*    read_thread;         // Demuxer thread
+    std::thread*    audio_thread;        // Audio decoder thread
+    std::atomic<bool> read_thread_running;
+    std::atomic<bool> audio_thread_running;
 };
 
 #endif // H_FFPLAYER_H

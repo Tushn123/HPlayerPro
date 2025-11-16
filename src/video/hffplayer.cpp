@@ -141,7 +141,7 @@ HFFPlayer::HFFPlayer()
     audio_play_buf = NULL;
     audio_play_buf_size = 0;
     audio_play_buf_index = 0;
-    hmutex_init(&audio_queue_mutex);
+    // audio_queue_mutex 使用 C++11 默认构造
 
     // 初始化时钟
     init_clock(&audio_clock);
@@ -171,12 +171,14 @@ HFFPlayer::HFFPlayer()
     block_timeout = DEFAULT_BLOCK_TIMEOUT;
     quit = 0;
 
-    // 初始化线程同步
-    hmutex_init(&decoder_mutex);
-    hmutex_init(&audio_queue_mutex);
-    hmutex_init(&format_mutex);
+    // 初始化线程同步 (C++11 标准库自动初始化)
     is_seeking.store(false);
-
+    
+    // 初始化多线程架构
+    read_thread = NULL;
+    audio_thread = NULL;
+    read_thread_running.store(false);
+    audio_thread_running.store(false);
 
     if (!s_ffmpeg_init.test_and_set()) {
         // av_register_all();
@@ -192,9 +194,7 @@ HFFPlayer::HFFPlayer()
 
 HFFPlayer::~HFFPlayer() {
     close();
-    hmutex_destroy(&decoder_mutex);
-    hmutex_destroy(&audio_queue_mutex);
-    hmutex_destroy(&format_mutex);
+    // C++11 标准库自动析构
 }
 
 int HFFPlayer::open() {
@@ -605,10 +605,69 @@ int HFFPlayer::open() {
     }
 
     HThread::setSleepPolicy(HThread::SLEEP_UNTIL, 1000 / fps);
+    
+    // 启动多线程解码架构
+    hlogi("启动多线程解码架构...");
+    
+    // 创建并启动读取线程（demuxer）
+    read_thread = new std::thread([this]() {
+        this->readTask();
+    });
+    hlogi("读取线程已启动");
+    
+    // 如果有音频，创建并启动音频解码线程
+    if (audio_codec_ctx && audio_dev_id != 0) {
+        audio_thread = new std::thread([this]() {
+            this->audioTask();
+        });
+        hlogi("音频解码线程已启动");
+    }
+    
+    hlogi("多线程解码架构启动完成");
     return ret;
 }
 
 int HFFPlayer::close() {
+    hlogi("开始关闭播放器...");
+    
+    // 停止所有线程
+    hlogi("停止读取线程...");
+    read_thread_running.store(false);
+    audio_thread_running.store(false);
+    
+    // 终止 packet 队列（让阻塞的线程退出）
+    packet_queue_abort(&video_packet_queue);
+    packet_queue_abort(&audio_packet_queue);
+    
+    // 等待读取线程退出
+    if (read_thread) {
+        if (read_thread->joinable()) {
+            read_thread->join();
+        }
+        delete read_thread;
+        read_thread = NULL;
+        hlogi("读取线程已停止");
+    }
+    
+    // 等待音频线程退出
+    if (audio_thread) {
+        if (audio_thread->joinable()) {
+            audio_thread->join();
+        }
+        delete audio_thread;
+        audio_thread = NULL;
+        hlogi("音频解码线程已停止");
+    }
+    
+    // 清空 packet 队列
+    hlogi("清空 packet 队列...");
+    packet_queue_flush(&video_packet_queue);
+    packet_queue_flush(&audio_packet_queue);
+    
+    // 打印队列统计信息（ffplay-style debug）
+    packet_queue_print_stats(&video_packet_queue, "Video");
+    packet_queue_print_stats(&audio_packet_queue, "Audio");
+    
     // 首先关闭SDL音频
     audio_close();
 
@@ -728,15 +787,21 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
 
     // 定位前清除帧缓存
     clear_frame_cache();
+    
+    // 清空 packet 队列
+    hlogi("定位：清空 packet 队列...");
+    packet_queue_flush(&video_packet_queue);
+    packet_queue_flush(&audio_packet_queue);
 
     // 清除音频队列
-    hmutex_lock(&audio_queue_mutex);
-    while (!audio_frame_queue.empty()) {
-        AudioFrame* af = audio_frame_queue.front();
-        audio_frame_queue.pop();
-        delete af;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex);
+        while (!audio_frame_queue.empty()) {
+            AudioFrame* af = audio_frame_queue.front();
+            audio_frame_queue.pop();
+            delete af;
+        }
     }
-    hmutex_unlock(&audio_queue_mutex);
 
     // 重置播放缓冲区
     audio_play_buf_index = 0;
@@ -759,7 +824,7 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
     }
 
     // 锁定 format_mutex 以防止与 doTask() 的并发访问
-    hmutex_lock(&format_mutex);
+    std::unique_lock<std::mutex> format_lock(format_mutex);
 
     // 尝试使用视频流时间戳定位(更准确)
     if (video_stream_index >= 0 && video_time_base_num && video_time_base_den) {
@@ -779,7 +844,6 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
 
             if (ret < 0) {
                 hloge("任何流 av_seek_frame 失败: %d", ret);
-                hmutex_unlock(&format_mutex);  // 返回前解锁
                 is_seeking.store(false);  // 返回前清除标志
                 return ret;
             } else {
@@ -797,21 +861,19 @@ int HFFPlayer::seek(int64_t ms, bool accurate) {
 
         if (ret < 0) {
             hloge("av_seek_frame 失败: %d", ret);
-            hmutex_unlock(&format_mutex);  // 返回前解锁
             is_seeking.store(false);  // 返回前清除标志
             return ret;
         }
     }
 
-    hmutex_unlock(&format_mutex);
+    format_lock.unlock();  // 手动解锁
 
     // 刷新前锁定解码器互斥锁
-    hmutex_lock(&decoder_mutex);
-
-    // 刷新解码器以清除缓冲的帧
-    flushDecoders();
-
-    hmutex_unlock(&decoder_mutex);
+    {
+        std::lock_guard<std::mutex> decoder_lock(decoder_mutex);
+        // 刷新解码器以清除缓冲的帧
+        flushDecoders();
+    }
 
     // 如果存在音频流且具有不同的时间基，可选地定位音频流
     if (audio_stream_index >= 0 && audio_time_base_num && audio_time_base_den) {
@@ -914,39 +976,176 @@ bool HFFPlayer::doFinish() {
     return ret == 0;
 }
 
-int HFFPlayer::processVideoPacket() {
+// ==================== PacketQueue 管理函数（C++11 标准库）====================
+int HFFPlayer::packet_queue_put(PacketQueue* q, AVPacket* pkt) {
+    if (!q || !pkt) return -1;
+    
+    {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        
+        if (q->abort_request.load()) {
+            av_packet_free(&pkt);
+            return -1;
+        }
+        
+        q->packets.push(pkt);
+        q->nb_packets++;
+        q->size += pkt->size;
+        if (pkt->duration > 0) {
+            q->duration += pkt->duration;
+        }
+        
+        // 统计信息
+        q->total_packets_put++;
+        if (q->nb_packets > q->max_nb_packets) {
+            q->max_nb_packets = q->nb_packets;
+        }
+        if (q->size > q->max_size) {
+            q->max_size = q->size;
+        }
+    }  // 自动解锁
+    
+    // 唤醒等待的线程（关键改进！）
+    q->cond.notify_one();
+    
+    return 0;
+}
+
+int HFFPlayer::packet_queue_get(PacketQueue* q, AVPacket* pkt, bool block) {
+    if (!q || !pkt) return -1;
+    
+    std::unique_lock<std::mutex> lock(q->mutex);
+    
+    while (!quit) {
+        if (q->abort_request.load()) {
+            return -1;
+        }
+        
+        if (!q->packets.empty()) {
+            AVPacket* queued_pkt = q->packets.front();
+            q->packets.pop();
+            q->nb_packets--;
+            q->size -= queued_pkt->size;
+            if (queued_pkt->duration > 0) {
+                q->duration -= queued_pkt->duration;
+            }
+            
+            // 统计信息
+            q->total_packets_get++;
+            
+            // 拷贝 packet 内容
+            av_packet_move_ref(pkt, queued_pkt);
+            av_packet_free(&queued_pkt);
+            
+            return 0;
+        }
+        
+        if (!block) {
+            return -1;
+        }
+        
+        // 使用条件变量等待（替代轮询！）
+        // 超时时间设为100ms，避免永久阻塞
+        q->cond.wait_for(lock, std::chrono::milliseconds(100));
+        
+        if (quit) {
+            return -1;
+        }
+    }
+    
+    return -1;
+}
+
+void HFFPlayer::packet_queue_flush(PacketQueue* q) {
+    if (!q) return;
+    
+    {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        
+        while (!q->packets.empty()) {
+            AVPacket* pkt = q->packets.front();
+            q->packets.pop();
+            av_packet_free(&pkt);
+        }
+        
+        q->nb_packets = 0;
+        q->size = 0;
+        q->duration = 0;
+    }
+    
+    // 唤醒所有等待的线程
+    q->cond.notify_all();
+}
+
+void HFFPlayer::packet_queue_abort(PacketQueue* q) {
+    if (!q) return;
+    
+    q->abort_request.store(true);
+    
+    // 唤醒所有等待的线程，让它们退出
+    q->cond.notify_all();
+}
+
+void HFFPlayer::packet_queue_start(PacketQueue* q) {
+    if (!q) return;
+    
+    q->abort_request.store(false);
+}
+
+int HFFPlayer::packet_queue_size(PacketQueue* q) {
+    if (!q) return 0;
+    
+    std::lock_guard<std::mutex> lock(q->mutex);
+    return q->nb_packets;
+}
+
+void HFFPlayer::packet_queue_print_stats(PacketQueue* q, const char* name) {
+    if (!q || !name) return;
+    
+    std::lock_guard<std::mutex> lock(q->mutex);
+    
+    hlogi("=== %s Queue Statistics ===", name);
+    hlogi("  Current: %d packets, %lld bytes, %lld duration", 
+          q->nb_packets, (long long)q->size, (long long)q->duration);
+    hlogi("  Peak: %d packets, %lld bytes", 
+          q->max_nb_packets, (long long)q->max_size);
+    hlogi("  Total: %llu put, %llu get, %llu in queue", 
+          (unsigned long long)q->total_packets_put,
+          (unsigned long long)q->total_packets_get,
+          (unsigned long long)(q->total_packets_put - q->total_packets_get));
+}
+
+// ==================== 解码处理函数 ====================
+int HFFPlayer::processVideoPacket(AVPacket* pkt) {
+    if (!pkt) return -1;
+    
     // 如果正在定位，跳过处理
     if (is_seeking.load()) {
         return AVERROR(EAGAIN);
     }
 
     // 锁定解码器互斥锁以防止与定位操作的竞争条件
-    hmutex_lock(&decoder_mutex);
+    std::lock_guard<std::mutex> lock(decoder_mutex);
 
     // 获取锁后再次检查定位标志
     if (is_seeking.load()) {
-        hmutex_unlock(&decoder_mutex);
         return AVERROR(EAGAIN);
     }
 
-    int ret = avcodec_send_packet(codec_ctx, packet);
+    int ret = avcodec_send_packet(codec_ctx, pkt);
     if (ret != 0) {
-        hmutex_unlock(&decoder_mutex);
         hloge("avcodec_send_packet 错误: %d", ret);
         return ret;
     }
 
     ret = avcodec_receive_frame(codec_ctx, frame);
     if (ret != 0) {
-        hmutex_unlock(&decoder_mutex);
         if (ret == AVERROR(EAGAIN)) {
             return ret;  // 需要更多数据包
         }
         hloge("avcodec_receive_frame 错误: %d", ret);
         return ret;
     }
-
-    hmutex_unlock(&decoder_mutex);
 
     // 在第一个解码帧上，验证/重新创建具有实际帧格式的 sws_ctx
     if (!sws_ctx_checked) {
@@ -1079,8 +1278,8 @@ int HFFPlayer::processVideoPacket() {
     return 0;
 }
 
-int HFFPlayer::processAudioPacket() {
-    if (!audio_codec_ctx) {
+int HFFPlayer::processAudioPacket(AVPacket* pkt) {
+    if (!pkt || !audio_codec_ctx) {
         return 0;  // 没有音频解码器初始化
     }
 
@@ -1090,32 +1289,27 @@ int HFFPlayer::processAudioPacket() {
     }
 
     // 锁定解码器互斥锁以防止与定位操作的竞争条件
-    hmutex_lock(&decoder_mutex);
+    std::lock_guard<std::mutex> lock(decoder_mutex);
 
     // 获取锁后再次检查定位标志
     if (is_seeking.load()) {
-        hmutex_unlock(&decoder_mutex);
         return AVERROR(EAGAIN);
     }
 
-    int ret = avcodec_send_packet(audio_codec_ctx, packet);
+    int ret = avcodec_send_packet(audio_codec_ctx, pkt);
     if (ret != 0) {
-        hmutex_unlock(&decoder_mutex);
         hloge("avcodec_send_packet (音频) 错误: %d", ret);
         return ret;
     }
 
     ret = avcodec_receive_frame(audio_codec_ctx, audio_frame);
     if (ret != 0) {
-        hmutex_unlock(&decoder_mutex);
         if (ret == AVERROR(EAGAIN)) {
             return ret;  // 需要更多数据包
         }
         hloge("avcodec_receive_frame (音频) 错误: %d", ret);
         return ret;
     }
-
-    hmutex_unlock(&decoder_mutex);
 
     // 如果需要，重采样音频
     if (swr_ctx && audio_buffer) {
@@ -1143,10 +1337,12 @@ int HFFPlayer::processAudioPacket() {
                 af->pts = audio_pts;
 
                 // 推送到队列
-                hmutex_lock(&audio_queue_mutex);
-                audio_frame_queue.push(af);
-                size_t queue_size = audio_frame_queue.size();
-                hmutex_unlock(&audio_queue_mutex);
+                size_t queue_size;
+                {
+                    std::lock_guard<std::mutex> lock(audio_queue_mutex);
+                    audio_frame_queue.push(af);
+                    queue_size = audio_frame_queue.size();
+                }
 
                 // 调试: 记录前几帧
                 static int audio_frame_count = 0;
@@ -1169,75 +1365,212 @@ int HFFPlayer::processAudioPacket() {
     return 0;
 }
 
-void HFFPlayer::doTask() {
-    // 循环直到获取视频帧或处理音频
-    while (!quit) {
-        // av_init_packet 在 FFmpeg 5.x 中已弃用，packet 已由 av_packet_alloc 初始化
+// ==================== 多线程解码架构 ====================
 
-        // 锁定 format_mutex 以防止与 seek() 的并发访问
-        hmutex_lock(&format_mutex);
-
-        // 检查是否正在定位
+// readTask: 专门负责读取 packet 并分发到队列（ffplay 的 read_thread + 水位线控制）
+void HFFPlayer::readTask() {
+    hlogi("读取线程启动");
+    read_thread_running.store(true);
+    
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        hloge("av_packet_alloc 失败");
+        read_thread_running.store(false);
+        return;
+    }
+    
+    // 水位线控制（ffplay-style）
+    const int MAX_QUEUE_SIZE = 100;      // 高水位线：暂停读取
+    const int MIN_QUEUE_SIZE = 50;       // 低水位线：恢复读取
+    const int64_t MAX_QUEUE_BYTES = 15 * 1024 * 1024;  // 15MB
+    bool paused_by_queue = false;
+    
+    // 统计变量
+    uint64_t total_read = 0;
+    uint64_t read_errors = 0;
+    
+    while (!quit && read_thread_running.load()) {
+        // 等待 seek 完成
         if (is_seeking.load()) {
-            hmutex_unlock(&format_mutex);
-            msleep(10);  // 等待定位完成
+            msleep(10);
             continue;
         }
-
-        fmt_ctx->interrupt_callback.callback = interrupt_callback;
-        fmt_ctx->interrupt_callback.opaque = this;
-        block_starttime = time(NULL);
-        //hlogi("av_read_frame");
-        int ret = av_read_frame(fmt_ctx, packet);
-        //hlogi("av_read_frame 返回值=%d", ret);
-        fmt_ctx->interrupt_callback.callback = NULL;
-
-        hmutex_unlock(&format_mutex);
-
-        if (ret != 0) {
-            hlogi("无帧: %d", ret);
-            if (!quit) {
-                if (ret == AVERROR_EOF || avio_feof(fmt_ctx->pb)) {
-                    eof = 1;
-                    event_callback(HPLAYER_EOF);
+        
+        // 队列大小控制：水位线机制（更智能！）
+        int video_queue_size = packet_queue_size(&video_packet_queue);
+        int audio_queue_size = packet_queue_size(&audio_packet_queue);
+        
+        int64_t video_queue_bytes;
+        {
+            std::lock_guard<std::mutex> lock(video_packet_queue.mutex);
+            video_queue_bytes = video_packet_queue.size;
+        }
+        
+        // 高水位：暂停读取
+        if (video_queue_size > MAX_QUEUE_SIZE || audio_queue_size > MAX_QUEUE_SIZE ||
+            video_queue_bytes > MAX_QUEUE_BYTES) {
+            if (!paused_by_queue) {
+                hlogi("队列达到高水位，暂停读取 (视频:%d, 音频:%d, %lldMB)", 
+                      video_queue_size, audio_queue_size, (long long)(video_queue_bytes / 1024 / 1024));
+                paused_by_queue = true;
+            }
+            msleep(10);
+            continue;
+        }
+        
+        // 低水位：恢复读取
+        if (paused_by_queue && video_queue_size < MIN_QUEUE_SIZE && 
+            audio_queue_size < MIN_QUEUE_SIZE) {
+            hlogi("队列降到低水位，恢复读取 (视频:%d, 音频:%d)", 
+                  video_queue_size, audio_queue_size);
+            paused_by_queue = false;
+        }
+        
+        // 锁定 format_mutex 以防止与 seek() 的并发访问
+        int ret;
+        {
+            std::lock_guard<std::mutex> lock(format_mutex);
+            
+            if (is_seeking.load()) {
+                msleep(10);
+                continue;
+            }
+            
+            fmt_ctx->interrupt_callback.callback = interrupt_callback;
+            fmt_ctx->interrupt_callback.opaque = this;
+            block_starttime = time(NULL);
+            
+            ret = av_read_frame(fmt_ctx, pkt);
+            
+            fmt_ctx->interrupt_callback.callback = NULL;
+        }
+        
+        if (ret < 0) {
+            read_errors++;
+            if (ret == AVERROR_EOF || avio_feof(fmt_ctx->pb)) {
+                hlogi("读取到文件末尾 (总读取: %llu, 错误: %llu)", 
+                      (unsigned long long)total_read, (unsigned long long)read_errors);
+                eof = 1;
+                event_callback(HPLAYER_EOF);
+            } else if (ret != AVERROR(EAGAIN)) {
+                hloge("av_read_frame 错误: %d (总读取: %llu, 错误: %llu)", 
+                      ret, (unsigned long long)total_read, (unsigned long long)read_errors);
+                error = ret;
+                event_callback(HPLAYER_ERROR);
+            }
+            msleep(10);
+            continue;
+        }
+        
+        total_read++;
+        
+        // 分发 packet 到对应队列
+        AVPacket* queued_pkt = av_packet_alloc();
+        if (queued_pkt) {
+            av_packet_move_ref(queued_pkt, pkt);
+            
+            if (queued_pkt->stream_index == video_stream_index) {
+                if (packet_queue_put(&video_packet_queue, queued_pkt) < 0) {
+                    av_packet_free(&queued_pkt);
                 }
-                else {
-                    error = ret;
-                    event_callback(HPLAYER_ERROR);
+            } else if (queued_pkt->stream_index == audio_stream_index) {
+                if (packet_queue_put(&audio_packet_queue, queued_pkt) < 0) {
+                    av_packet_free(&queued_pkt);
                 }
+            } else {
+                // 其他流，直接丢弃
+                av_packet_free(&queued_pkt);
             }
-            return;
         }
-
-        // 注意: 如果不调用 av_packet_unref，内存泄漏。
-        defer (av_packet_unref(packet);)
-
-            // hlogi("流索引=%d 数据=%p 长度=%d", packet->stream_index, packet->data, packet->size);
-
-            // 处理视频包
-            if (packet->stream_index == video_stream_index) {
-            ret = processVideoPacket();
-            if (ret == 0) {
-                // 成功解码视频帧，退出循环
-                break;
-            }
-            else if (ret != AVERROR(EAGAIN)) {
-                // 致命错误
-                return;
-            }
-            // EAGAIN 表示需要更多数据包，继续读取
-        }
-        // 处理音频包
-        else if (packet->stream_index == audio_stream_index) {
-            ret = processAudioPacket();
-            if (ret != 0 && ret != AVERROR(EAGAIN)) {
-                // 非致命音频错误，记录并继续
-                // 音频处理不阻塞视频播放
-            }
-            // 继续读取视频帧
-        }
-        // 跳过其他流
+        
+        av_packet_unref(pkt);
     }
+    
+    av_packet_free(&pkt);
+    read_thread_running.store(false);
+    
+    hlogi("读取线程退出 (总读取: %llu packets, 错误: %llu)", 
+          (unsigned long long)total_read, (unsigned long long)read_errors);
+}
+
+// doTask: 视频解码线程（从队列取 packet 解码）
+void HFFPlayer::doTask() {
+    hlogi("视频解码线程启动");
+    
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        hloge("av_packet_alloc 失败");
+        return;
+    }
+    
+    while (!quit) {
+        // 从视频队列获取 packet
+        int ret = packet_queue_get(&video_packet_queue, pkt, true);
+        
+        if (ret < 0) {
+            // 队列为空或被终止
+            if (quit) break;
+            msleep(10);
+            continue;
+        }
+        
+        // 处理视频 packet
+        ret = processVideoPacket(pkt);
+        av_packet_unref(pkt);
+        
+        if (ret == 0) {
+            // 成功解码视频帧
+            // 注意：这里不 break，持续解码
+        } else if (ret != AVERROR(EAGAIN)) {
+            // 非致命错误，继续
+        }
+    }
+    
+    av_packet_free(&pkt);
+    hlogi("视频解码线程退出");
+}
+
+// audioTask: 音频解码线程（从队列取 packet 解码）
+void HFFPlayer::audioTask() {
+    hlogi("音频解码线程启动");
+    audio_thread_running.store(true);
+    
+    if (!audio_codec_ctx) {
+        hlogi("无音频解码器，音频线程退出");
+        audio_thread_running.store(false);
+        return;
+    }
+    
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        hloge("av_packet_alloc 失败");
+        audio_thread_running.store(false);
+        return;
+    }
+    
+    while (!quit && audio_thread_running.load()) {
+        // 从音频队列获取 packet
+        int ret = packet_queue_get(&audio_packet_queue, pkt, true);
+        
+        if (ret < 0) {
+            // 队列为空或被终止
+            if (quit) break;
+            msleep(10);
+            continue;
+        }
+        
+        // 处理音频 packet
+        ret = processAudioPacket(pkt);
+        av_packet_unref(pkt);
+        
+        if (ret != 0 && ret != AVERROR(EAGAIN)) {
+            // 非致命音频错误，继续
+        }
+    }
+    
+    av_packet_free(&pkt);
+    audio_thread_running.store(false);
+    hlogi("音频解码线程退出");
 }
 
 // ==================== 时钟函数 ====================
@@ -1404,16 +1737,17 @@ void HFFPlayer::sdl_audio_callback(void* userdata, uint8_t* stream, int len) {
 }
 
 int HFFPlayer::audio_decode_frame(double* pts_ptr) {
-    hmutex_lock(&audio_queue_mutex);
-
-    if (audio_frame_queue.empty()) {
-        hmutex_unlock(&audio_queue_mutex);
-        return -1;
+    AudioFrame* af = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex);
+        
+        if (audio_frame_queue.empty()) {
+            return -1;
+        }
+        
+        af = audio_frame_queue.front();
+        audio_frame_queue.pop();
     }
-
-    AudioFrame* af = audio_frame_queue.front();
-    audio_frame_queue.pop();
-    hmutex_unlock(&audio_queue_mutex);
 
     if (af && af->data && af->size > 0) {
         *pts_ptr = af->pts;
@@ -1508,13 +1842,14 @@ void HFFPlayer::audio_close() {
     }
 
     // 清除音频队列
-    hmutex_lock(&audio_queue_mutex);
-    while (!audio_frame_queue.empty()) {
-        AudioFrame* af = audio_frame_queue.front();
-        audio_frame_queue.pop();
-        delete af;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex);
+        while (!audio_frame_queue.empty()) {
+            AudioFrame* af = audio_frame_queue.front();
+            audio_frame_queue.pop();
+            delete af;
+        }
     }
-    hmutex_unlock(&audio_queue_mutex);
 
     // 释放播放缓冲区
     if (audio_play_buf) {
