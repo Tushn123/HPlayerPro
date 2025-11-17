@@ -87,17 +87,6 @@ public:
     
     // Playback speed control (overrides base class to add timestamp adjustment)
     virtual void set_speed(double speed) override;
-    
-    /* Usage examples:
-     * player.seek(30000);              // Seek to 30 seconds (fast mode, to keyframe)
-     * player.seek(30000, true);        // Seek to 30 seconds (accurate mode)
-     * player.seekByPercent(50.0);      // Seek to 50% of video duration
-     * player.seekRelative(5000);       // Skip forward 5 seconds
-     * player.seekRelative(-5000);      // Skip backward 5 seconds
-     * int64_t pos = player.getCurrentPosition(); // Get current position in ms
-     * player.set_speed(2.0);           // 2x speed playback
-     * player.set_speed(0.5);           // 0.5x speed (slow motion)
-     */
 
 private:
     virtual bool doPrepare();
@@ -122,60 +111,110 @@ private:
 
     AVDictionary*       fmt_opts;
     AVDictionary*       codec_opts;
-
     AVFormatContext*    fmt_ctx;
-    AVCodecContext*     codec_ctx;
+    AVPacket*           packet;
+    int                 subtitle_stream_index;  // 字幕流索引（未封装）
 
-    AVPacket* packet;
-    AVFrame* frame;
-
-    int video_stream_index;
-    int audio_stream_index;
-    int subtitle_stream_index;
-
-    int video_time_base_num;
-    int video_time_base_den;
-    int audio_time_base_num;
-    int audio_time_base_den;
-
-    // for video scale
-    AVPixelFormat   src_pix_fmt;
-    AVPixelFormat   dst_pix_fmt;
-    SwsContext*     sws_ctx;
-    uint8_t*        data[4];
-    int             linesize[4];
-    HFrame          hframe;
-    bool            sws_ctx_checked;  // Flag to check if sws_ctx format matches actual decoded frame
-
-    // for audio
-    AVCodecContext* audio_codec_ctx;
-    AVFrame*        audio_frame;
-    SwrContext*     swr_ctx;
-    uint8_t*        audio_buffer;
-    int             audio_buffer_size;
-    int             audio_channels;
-    int             audio_sample_rate;
+    // ==================== 内部上下文结构体（方案1封装）====================
     
-    // SDL audio
-    SDL_AudioDeviceID audio_dev_id;
-    int             audio_hw_buf_size;
-    std::queue<AudioFrame*> audio_frame_queue;
-    std::mutex      audio_queue_mutex;      // C++11 标准互斥锁
-    uint8_t*        audio_play_buf;
-    int             audio_play_buf_size;
-    int             audio_play_buf_index;
+    // 视频解码上下文：封装所有视频相关变量
+    struct VideoContext {
+        AVCodecContext* codec_ctx;
+        AVFrame* frame;
+        SwsContext* sws_ctx;
+        AVPixelFormat src_pix_fmt;
+        AVPixelFormat dst_pix_fmt;
+        uint8_t* data[4];
+        int linesize[4];
+        HFrame hframe;
+        bool sws_ctx_checked;
+        int stream_index;
+        int time_base_num;
+        int time_base_den;
+        
+        VideoContext() 
+            : codec_ctx(nullptr), frame(nullptr), sws_ctx(nullptr),
+              src_pix_fmt(AV_PIX_FMT_NONE), dst_pix_fmt(AV_PIX_FMT_NONE),
+              sws_ctx_checked(false), stream_index(-1),
+              time_base_num(0), time_base_den(0) {
+            memset(data, 0, sizeof(data));
+            memset(linesize, 0, sizeof(linesize));
+        }
+    };
     
-    // Clocks for A/V sync
-    Clock           audio_clock;
-    Clock           video_clock;
-    int             av_sync_type;       // 0=audio master, 1=video master, 2=external
-    double          audio_diff_cum;
-    double          audio_diff_avg_coef;
-    int             audio_diff_avg_count;
-    double          frame_timer;
-    double          frame_last_pts;
-    double          frame_last_delay;
+    // 音频播放上下文：封装所有音频相关变量
+    struct AudioContext {
+        AVCodecContext* codec_ctx;
+        AVFrame* frame;
+        SwrContext* swr_ctx;
+        uint8_t* buffer;
+        int buffer_size;
+        int channels;
+        int sample_rate;
+        SDL_AudioDeviceID dev_id;
+        int hw_buf_size;
+        std::queue<AudioFrame*> frame_queue;
+        std::mutex queue_mutex;
+        uint8_t* play_buf;
+        int play_buf_size;
+        int play_buf_index;
+        int stream_index;
+        int time_base_num;
+        int time_base_den;
+        
+        AudioContext()
+            : codec_ctx(nullptr), frame(nullptr), swr_ctx(nullptr),
+              buffer(nullptr), buffer_size(0), channels(0), sample_rate(0),
+              dev_id(0), hw_buf_size(0), play_buf(nullptr),
+              play_buf_size(0), play_buf_index(0),
+              stream_index(-1), time_base_num(0), time_base_den(0) {}
+    };
+    
+    // 同步上下文：封装所有A/V同步相关变量
+    struct SyncContext {
+        Clock audio_clock;
+        Clock video_clock;
+        int av_sync_type;           // 0=audio master, 1=video master, 2=external
+        double audio_diff_cum;
+        double audio_diff_avg_coef;
+        int audio_diff_avg_count;
+        double frame_timer;
+        double frame_last_pts;
+        double frame_last_delay;
+        bool first_frame;           // 首帧标志（修复第二次播放bug）
+        
+        SyncContext()
+            : av_sync_type(0), audio_diff_cum(0),
+              audio_diff_avg_coef(0), audio_diff_avg_count(0),
+              frame_timer(0), frame_last_pts(0), frame_last_delay(0),
+              first_frame(true) {}
+    };
+    
+    // 线程上下文：封装所有多线程相关变量
+    struct ThreadContext {
+        PacketQueue video_packet_queue;
+        PacketQueue audio_packet_queue;
+        std::thread* read_thread;
+        std::thread* audio_thread;
+        std::atomic<bool> read_thread_running;
+        std::atomic<bool> audio_thread_running;
+        std::mutex decoder_mutex;
+        std::mutex format_mutex;
+        std::atomic<bool> is_seeking;
+        
+        ThreadContext()
+            : read_thread(nullptr), audio_thread(nullptr),
+              read_thread_running(false), audio_thread_running(false),
+              is_seeking(false) {}
+    };
+    
+    // ==================== 上下文实例 ====================
+    VideoContext video_;    // 视频上下文
+    AudioContext audio_;    // 音频上下文
+    SyncContext sync_;      // 同步上下文
+    ThreadContext thread_;  // 线程上下文
 
+    // ==================== 成员函数 ====================
     // processing functions
     int processVideoPacket(AVPacket* pkt);
     int processAudioPacket(AVPacket* pkt);
@@ -200,25 +239,18 @@ private:
     int get_master_sync_type();
     double compute_target_delay(double delay);
     
-    // Audio functions
-    int audio_open();
-    void audio_close();
+    // Video functions (封装视频初始化/清理)
+    int video_init();       // 初始化视频解码器
+    void video_close();     // 清理视频资源
+    
+    // Audio functions (封装音频初始化/清理)
+    int audio_init();       // 初始化音频解码器
+    void audio_close_decoder();  // 清理音频解码器资源
+    int audio_open();       // 打开SDL音频设备
+    void audio_close();     // 关闭SDL音频设备
     static void sdl_audio_callback(void* userdata, uint8_t* stream, int len);
     int audio_decode_frame(double* pts_ptr);
     int synchronize_audio(int nb_samples);
-    
-    // Thread synchronization (C++11 standard library)
-    std::mutex      decoder_mutex;       // Protects decoder operations
-    std::mutex      format_mutex;        // Protects fmt_ctx operations (read/seek)
-    std::atomic<bool> is_seeking;        // Flag to indicate seeking in progress
-    
-    // Multi-threaded packet queues (ffplay-style)
-    PacketQueue     video_packet_queue;
-    PacketQueue     audio_packet_queue;
-    std::thread*    read_thread;         // Demuxer thread
-    std::thread*    audio_thread;        // Audio decoder thread
-    std::atomic<bool> read_thread_running;
-    std::atomic<bool> audio_thread_running;
 };
 
 #endif // H_FFPLAYER_H
